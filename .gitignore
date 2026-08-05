@@ -27,3 +27,4 @@ docs
 3rdparty
 .claude
 .bux-tmp
+.DS_Store
