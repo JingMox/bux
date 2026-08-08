@@ -1,10 +1,9 @@
 //! Pre-exec hardening for child processes.
 //!
 //! Applied after `fork()` but before `exec()`:
-//! 1. **Die with parent** — `PR_SET_PDEATHSIG(SIGKILL)` prevents orphaned VMs
-//!    (Linux only; on macOS the watchdog pipe provides equivalent detection).
-//! 2. **FD cleanup** — close all inherited file descriptors ≥ 3, except for
-//!    an optionally preserved FD (used by the watchdog pipe).
+//! 1. **Landlock** (Linux, optional) — apply ruleset then close its fd.
+//! 2. **Die with parent** — `PR_SET_PDEATHSIG(SIGKILL)` (Linux).
+//! 3. **FD cleanup** — close inherited FDs ≥ 3 except preserved ones.
 
 #![allow(
     unsafe_code,
@@ -14,30 +13,45 @@
 
 use std::process::Command;
 
+/// FDs that must survive into the child until we explicitly handle them.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PreserveFds {
+    /// Watchdog pipe read end (optional).
+    pub watchdog: Option<i32>,
+    /// Landlock ruleset fd — applied then closed inside `pre_exec` (optional).
+    pub landlock: Option<i32>,
+}
+
 /// Install pre-exec hooks on the command.
-///
-/// `preserve_fd` — an FD that must survive into the exec'd process (e.g.
-/// the watchdog pipe read end). Pass `None` to close everything.
-///
-/// On non-Unix platforms this is a no-op.
 #[cfg(not(unix))]
-pub fn apply(_cmd: &mut Command, _preserve_fd: Option<i32>) {}
+pub fn apply(_cmd: &mut Command, _preserve: PreserveFds) {}
 
 /// Install pre-exec hooks on the command.
 #[cfg(unix)]
-pub(super) fn apply(cmd: &mut Command, preserve_fd: Option<i32>) {
+pub(crate) fn apply(cmd: &mut Command, preserve: PreserveFds) {
     use std::os::unix::process::CommandExt;
 
     // SAFETY: all operations inside are async-signal-safe syscalls.
-    // pre_exec is inherently unsafe — it runs between fork and exec.
     unsafe {
         cmd.pre_exec(move || {
-            // 1. Die when parent exits — prevents orphaned VM processes.
+            // 1. Landlock first (closes its own fd). Linux only.
+            #[cfg(target_os = "linux")]
+            if let Some(fd) = preserve.landlock {
+                // SAFETY: fd is a ruleset from PathRestrictions::build.
+                let errno = bux_landlock::restrict_self(fd);
+                if errno != 0 {
+                    return Err(std::io::Error::from_raw_os_error(errno));
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = preserve.landlock;
+
+            // 2. Die when parent exits — prevents orphaned VM processes.
             #[cfg(target_os = "linux")]
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
 
-            // 2. Close all inherited file descriptors >= 3, except preserve_fd.
-            close_inherited_fds(preserve_fd);
+            // 3. Close inherited FDs except watchdog (landlock already closed).
+            close_inherited_fds(preserve.watchdog);
 
             Ok(())
         });
@@ -45,12 +59,6 @@ pub(super) fn apply(cmd: &mut Command, preserve_fd: Option<i32>) {
 }
 
 /// Close all file descriptors >= 3, optionally preserving one.
-///
-/// # Note
-///
-/// This runs in a `pre_exec` context (between fork/exec). Only
-/// async-signal-safe functions may be called. Raw libc is intentional
-/// here — nix wrappers allocate and are not async-signal-safe.
 #[cfg(unix)]
 fn close_inherited_fds(preserve: Option<i32>) {
     match preserve {
@@ -62,7 +70,6 @@ fn close_inherited_fds(preserve: Option<i32>) {
 /// Close all FDs >= 3 unconditionally.
 #[cfg(unix)]
 fn close_all_fds() {
-    // Try close_range(3, u32::MAX, 0) — available on Linux 5.9+.
     #[cfg(target_os = "linux")]
     {
         // SAFETY: close_range is a valid syscall on Linux 5.9+; arguments are well-formed.
@@ -75,9 +82,6 @@ fn close_all_fds() {
 }
 
 /// Close all FDs >= 3 except `keep`.
-///
-/// On Linux 5.9+ uses two `close_range` calls to skip the preserved FD.
-/// Falls back to an iterative loop otherwise.
 #[cfg(unix)]
 fn close_fds_preserving(keep: i32) {
     #[cfg(target_os = "linux")]

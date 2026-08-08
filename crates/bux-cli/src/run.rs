@@ -61,9 +61,25 @@ pub struct RunArgs {
     #[arg(short = 'w', long)]
     workdir: Option<String>,
 
-    /// Publish a port (format: hostPort:guestPort[/tcp|udp]).
+    /// Publish a TCP port (host:guest, guest, 0:guest, :guest; optional /tcp).
+    ///
+    /// Host bind is always 0.0.0.0. UDP is not supported in v1.
     #[arg(short = 'p', long = "publish")]
     publish: Vec<String>,
+
+    /// Restrict egress to hostnames/CIDRs (repeatable). Empty = unrestricted.
+    #[arg(long = "allow-net")]
+    allow_net: Vec<String>,
+
+    /// Network mode: `enabled` (gvproxy virtio-net, default) or `none` (TSI / offline).
+    #[arg(long, default_value = "enabled", value_parser = ["enabled", "none"])]
+    network: String,
+
+    /// Host MITM secret (`name=value@host1,host2` or `name=value` using --allow-net hosts).
+    ///
+    /// Real values never enter the guest; use placeholders like `<BUX_SECRET:name>` in traffic.
+    #[arg(long = "secret")]
+    secrets: Vec<String>,
 
     /// Bind mount a volume (format: `hostPath:guestPath[:ro]`).
     #[arg(short = 'v', long = "volume")]
@@ -118,7 +134,98 @@ pub struct RunArgs {
     command: Vec<String>,
 }
 
+/// Arguments for `bux create` — start a VM without an initial command.
+#[derive(clap::Args)]
+pub struct CreateArgs {
+    /// OCI image reference.
+    #[arg(required = true)]
+    image: String,
+
+    /// Assign a name to the VM.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Automatically remove the VM when it stops.
+    #[arg(long)]
+    rm: bool,
+
+    /// Number of virtual CPUs.
+    #[arg(long, default_value_t = 1)]
+    cpus: u8,
+
+    /// Memory in MiB.
+    #[arg(long, short = 'm', default_value_t = 512)]
+    memory: u32,
+
+    /// Publish a TCP port.
+    #[arg(short = 'p', long = "publish")]
+    publish: Vec<String>,
+
+    /// Restrict egress (repeatable). Empty = unrestricted.
+    #[arg(long = "allow-net")]
+    allow_net: Vec<String>,
+
+    /// Network mode: `enabled` or `none`.
+    #[arg(long, default_value = "enabled", value_parser = ["enabled", "none"])]
+    network: String,
+
+    /// Host MITM secret (`name=value@host` or `name=value`).
+    #[arg(long = "secret")]
+    secrets: Vec<String>,
+
+    /// Bind mount (`hostPath:guestPath[:ro]`).
+    #[arg(short = 'v', long = "volume")]
+    volume: Vec<String>,
+
+    /// libkrun log level.
+    #[arg(long, default_value = "info")]
+    log_level: LogLevel,
+}
+
+impl CreateArgs {
+    /// Create + start VM, print ID (no initial command).
+    pub async fn run(self) -> Result<()> {
+        // Reuse run path as detached empty-command run.
+        let args = RunArgs {
+            image: Some(self.image),
+            root: None,
+            root_disk: None,
+            disk: true,
+            name: self.name,
+            detach: true,
+            rm: self.rm,
+            cpus: self.cpus,
+            memory: self.memory,
+            workdir: None,
+            publish: self.publish,
+            allow_net: self.allow_net,
+            network: self.network,
+            secrets: self.secrets,
+            volume: self.volume,
+            env: vec![],
+            env_file: vec![],
+            user: None,
+            interactive: false,
+            tty: false,
+            entrypoint: None,
+            ulimit: vec![],
+            nested_virt: false,
+            snd: false,
+            console_output: None,
+            log_level: self.log_level,
+            command: vec![],
+        };
+        args.run().await
+    }
+}
+
 impl RunArgs {
+    /// Create/start VM according to CLI flags.
+    #[allow(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "CLI orchestration; splitting obscures flag wiring"
+    )]
     pub async fn run(self) -> Result<()> {
         if self.root_disk.is_some() {
             anyhow::bail!(
@@ -126,10 +233,10 @@ impl RunArgs {
             )
         }
 
-        let resolved = self.resolve_rootfs().await?;
-        let rootfs = resolved.path;
-        let oci_cfg = resolved.oci_cfg;
-        let disk_cache_key = resolved.disk_cache_key;
+        let resolved_root = self.resolve_rootfs().await?;
+        let rootfs = resolved_root.path;
+        let oci_cfg = resolved_root.oci_cfg;
+        let disk_cache_key = resolved_root.disk_cache_key;
 
         let image = self.image.clone();
         let name = self.name;
@@ -191,17 +298,50 @@ impl RunArgs {
             .chain(self.env)
             .collect();
 
-        // Ports: -p hostPort:guestPort[/proto]
+        // Ports: -p host:guest | guest | 0:guest | :guest [/tcp]
         for spec in &self.publish {
-            let port_part = spec.split('/').next().unwrap_or(spec);
-            b = b.port(port_part);
+            // Validate early with the same parser Runtime uses.
+            bux::parse_publish_spec(spec).with_context(|| format!("invalid -p {spec:?}"))?;
+            b = b.port(spec.clone());
         }
 
-        // Volumes: -v hostPath:guestPath[:ro]  →  auto-generate virtiofs tag.
-        for (idx, spec) in self.volume.iter().enumerate() {
-            let (host, _guest, _ro) = parse_volume(spec)?;
-            let tag = format!("vol{idx}");
-            b = b.virtiofs(&tag, &host);
+        if !self.allow_net.is_empty() {
+            b = b.allow_net(self.allow_net.clone());
+        }
+
+        let virtio_net = self.network != "none";
+        b = b.virtio_net(virtio_net);
+
+        if !self.secrets.is_empty() {
+            if !virtio_net {
+                anyhow::bail!("--secret requires --network=enabled (gvproxy MITM)");
+            }
+            let secrets = parse_secrets(&self.secrets, &self.allow_net)?;
+            b = b.secrets(secrets);
+        }
+
+        // Volumes: -v hostPath:guestPath[:ro] — policy checked via VolumeManager.
+        if !self.volume.is_empty() {
+            let data = bux::default_data_dir();
+            let db = std::sync::Arc::new(
+                bux::StateDb::open(data.join("bux.db"))
+                    .context("open state db for volume validation")?,
+            );
+            let vol_mgr =
+                bux::VolumeManager::open(&data, db).context("open volume manager")?;
+            let mut mounts = Vec::with_capacity(self.volume.len());
+            for spec in &self.volume {
+                mounts.push(
+                    bux::parse_bind_spec(spec)
+                        .with_context(|| format!("invalid -v {spec:?}"))?,
+                );
+            }
+            let resolved_vols = vol_mgr
+                .resolve_mounts(&mounts)
+                .context("volume path validation failed")?;
+            for r in resolved_vols {
+                b = b.virtiofs_share(r.to_virtiofs());
+            }
         }
 
         // Ulimits.
@@ -233,7 +373,7 @@ impl RunArgs {
                 user.as_deref(),
                 interactive,
                 tty,
-            )?)
+            ))
         };
 
         if exec_req.is_none() && has_exec_options {
@@ -350,29 +490,50 @@ async fn stop_vm(id: &str) -> Result<()> {
     }
 }
 
-/// Parses Docker-style volume spec: `hostPath:guestPath[:ro]`.
-fn parse_volume(spec: &str) -> Result<(String, String, bool)> {
-    let parts: Vec<&str> = spec.splitn(3, ':').collect();
-    match parts.as_slice() {
-        [host, guest] => Ok((host.to_string(), guest.to_string(), false)),
-        [host, guest, opts] => {
-            let ro = opts.split(',').any(|o| o.eq_ignore_ascii_case("ro"));
-            Ok((host.to_string(), guest.to_string(), ro))
-        }
-        _ => anyhow::bail!("invalid volume spec {spec:?}; use hostPath:guestPath[:ro]"),
+/// Parse `--secret` specs into [`bux::Secret`] values.
+///
+/// Formats:
+/// - `name=value@host1,host2`
+/// - `name=value` (hosts from `--allow-net`, or `*` if empty)
+pub fn parse_secrets(specs: &[String], allow_net: &[String]) -> Result<Vec<bux::Secret>> {
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        out.push(parse_one_secret(spec, allow_net)?);
     }
+    Ok(out)
 }
 
-/// Parses `uid[:gid]` user spec.
-pub fn parse_user(spec: &str) -> Result<(u32, Option<u32>)> {
-    if let Some((u, g)) = spec.split_once(':') {
-        let uid = u.parse().context("invalid UID")?;
-        let gid = g.parse().context("invalid GID")?;
-        Ok((uid, Some(gid)))
-    } else {
-        let uid = spec.parse().context("invalid UID")?;
-        Ok((uid, None))
+fn parse_one_secret(spec: &str, allow_net: &[String]) -> Result<bux::Secret> {
+    let (left, hosts_part) = match spec.rsplit_once('@') {
+        Some((l, h)) if l.contains('=') => (l, Some(h)),
+        _ => (spec, None),
+    };
+    let (name, value) = left.split_once('=').with_context(|| {
+        format!("invalid --secret {spec:?}; expected name=value or name=value@host1,host2")
+    })?;
+    if name.is_empty() || value.is_empty() {
+        anyhow::bail!("invalid --secret {spec:?}: name and value must be non-empty");
     }
+    let hosts: Vec<String> = hosts_part.map_or_else(
+        || {
+            if allow_net.is_empty() {
+                vec!["*".into()]
+            } else {
+                allow_net.to_vec()
+            }
+        },
+        |h| {
+            h.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        },
+    );
+    if hosts.is_empty() {
+        anyhow::bail!("--secret {name}: no hosts (use @host or --allow-net)");
+    }
+    Ok(bux::Secret::new(name, hosts, value))
 }
 
 /// Creates an ext4 disk image from an OCI rootfs directory.
@@ -424,7 +585,7 @@ fn hash_rootfs_entry(root: &Path, path: &Path, hasher: &mut Sha256) -> Result<()
     hasher.update(meta.mode().to_le_bytes());
 
     if meta.is_file() {
-        hasher.update([b'f']);
+        hasher.update(b"f");
         let mut file = std::fs::File::open(path)?;
         let mut buf = [0_u8; 8192];
         loop {
@@ -435,18 +596,18 @@ fn hash_rootfs_entry(root: &Path, path: &Path, hasher: &mut Sha256) -> Result<()
             hasher.update(&buf[..n]);
         }
     } else if meta.is_dir() {
-        hasher.update([b'd']);
+        hasher.update(b"d");
         let mut entries = std::fs::read_dir(path)?.collect::<std::result::Result<Vec<_>, _>>()?;
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             hash_rootfs_entry(root, &entry.path(), hasher)?;
         }
     } else if meta.is_symlink() {
-        hasher.update([b'l']);
+        hasher.update(b"l");
         let target = std::fs::read_link(path)?;
         hasher.update(target.as_os_str().as_bytes());
     } else {
-        hasher.update([b'o']);
+        hasher.update(b"o");
     }
 
     Ok(())
@@ -504,4 +665,29 @@ async fn spawn_vm(
     _auto_remove: bool,
 ) -> Result<()> {
     anyhow::bail!("VM execution requires Linux or macOS")
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn parse_with_hosts() {
+        let s = parse_one_secret("openai=sk-x@api.openai.com,api.example.com", &[]).unwrap();
+        assert_eq!(s.name, "openai");
+        assert_eq!(s.value, "sk-x");
+        assert_eq!(s.hosts, vec!["api.openai.com", "api.example.com"]);
+    }
+
+    #[test]
+    fn parse_uses_allow_net() {
+        let s = parse_one_secret("t=val", &["h1".into()]).unwrap();
+        assert_eq!(s.hosts, vec!["h1"]);
+    }
+
+    #[test]
+    fn parse_star_default() {
+        let s = parse_one_secret("t=val", &[]).unwrap();
+        assert_eq!(s.hosts, vec!["*"]);
+    }
 }

@@ -1,0 +1,332 @@
+//! Process isolation for the `bux-shim` child process.
+//!
+//! The [`Sandbox`] trait abstracts platform-specific sandboxing:
+//! - **Linux**: bubblewrap namespace isolation (via [`bux-bwrap`]) + Landlock (K22).
+//! - **macOS**: `sandbox-exec` with a deny-default SBPL profile.
+//! - **Fallback**: bare `Command` with pre-exec hardening only.
+//!
+//! The default sandbox is auto-detected at runtime. Override via
+//! [`JailConfig::sandbox`].
+
+/// Host / guest capability probes.
+pub mod checks;
+/// Linux credential dropping (uid/gid/caps).
+#[cfg(target_os = "linux")]
+pub mod credentials;
+mod error;
+mod pre_exec;
+/// Security layer status types.
+pub mod security;
+
+#[cfg(target_os = "linux")]
+mod bwrap;
+#[cfg(target_os = "linux")]
+mod landlock_setup;
+#[cfg(target_os = "macos")]
+mod seatbelt;
+
+use std::os::unix::io::RawFd;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+
+pub use bux_cgroup::ResourceLimits;
+pub use error::{Error, Result};
+pub use security::{LayerStatus, SandboxKind, SecurityReport};
+
+#[cfg(target_os = "linux")]
+use bwrap::BwrapSandbox;
+#[cfg(target_os = "macos")]
+use seatbelt::SeatbeltSandbox;
+
+/// Environment variable set on the shim child when a watchdog FD is preserved.
+///
+/// Value is the decimal file descriptor number. Must match
+/// `bux_shim::ENV_WATCHDOG_FD` / the shim binary.
+pub const ENV_WATCHDOG_FD: &str = "BUX_WATCHDOG_FD";
+
+/// Describes the isolation features provided by a [`Sandbox`] implementation.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+#[allow(clippy::struct_excessive_bools, reason = "capability flags struct")]
+pub struct SandboxCapabilities {
+    /// Whether the sandbox provides namespace isolation (mount, PID, net, etc.).
+    pub namespaces: bool,
+    /// Whether the sandbox applies seccomp BPF syscall filtering.
+    pub seccomp: bool,
+    /// Whether mandatory access control is enforced (AppArmor/SELinux/Seatbelt).
+    pub mandatory_access_control: bool,
+    /// Whether cgroup-based resource limits are enforced.
+    pub cgroups: bool,
+}
+
+/// Trait for platform-specific process sandboxing.
+///
+/// Implementations wrap a `Command` with isolation primitives (namespaces,
+/// seatbelt profiles, seccomp, etc.) before the shim process is spawned.
+pub trait Sandbox: std::fmt::Debug + Send + Sync {
+    /// Wraps the shim invocation with sandbox-specific isolation.
+    ///
+    /// Returns a pre-configured [`Command`] that will execute the shim
+    /// inside the sandbox, or `None` if the sandbox is not available on
+    /// this system (e.g. bwrap binary not installed).
+    fn wrap(&self, shim: &Path, config_path: &Path, jail: &JailConfig) -> Option<Command>;
+
+    /// Returns the isolation capabilities this sandbox provides.
+    ///
+    /// Used for security auditing and reporting.
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::default()
+    }
+
+    /// Stable kind label for security reports.
+    fn kind(&self) -> SandboxKind {
+        SandboxKind::Noop
+    }
+}
+
+/// No-op sandbox: runs the shim directly with no additional isolation.
+///
+/// Pre-exec hardening (FD cleanup, die-with-parent, Landlock) is still applied.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopSandbox;
+
+impl Sandbox for NoopSandbox {
+    fn wrap(&self, shim: &Path, config_path: &Path, _jail: &JailConfig) -> Option<Command> {
+        let mut cmd = Command::new(shim);
+        cmd.arg(config_path);
+        Some(cmd)
+    }
+
+    fn kind(&self) -> SandboxKind {
+        SandboxKind::Noop
+    }
+}
+
+/// Sandbox configuration for a single VM spawn.
+///
+/// Constructed by the Runtime (or tests). Not `non_exhaustive` so
+/// in-workspace callers can fill all fields explicitly without a builder.
+#[derive(Debug)]
+pub struct JailConfig {
+    /// Path to the rootfs directory (if using directory-based root).
+    pub rootfs: Option<PathBuf>,
+    /// Path to the root disk image (if using disk-based root).
+    pub root_disk: Option<PathBuf>,
+    /// Extra read-only paths (e.g. QCOW2 backing chain). Filled by Runtime.
+    pub readonly_paths: Vec<PathBuf>,
+    /// Directory containing Unix sockets for vsock.
+    pub socks_dir: PathBuf,
+    /// Host paths for virtiofs mounts.
+    pub virtiofs_paths: Vec<PathBuf>,
+    /// Watchdog pipe read-end FD to preserve across exec.
+    pub watchdog_fd: Option<RawFd>,
+    /// Override the default platform sandbox.
+    ///
+    /// When `None`, auto-detects: bwrap on Linux, seatbelt on macOS,
+    /// noop otherwise.
+    pub sandbox: Option<Box<dyn Sandbox>>,
+    /// cgroup v2 resource limits (Linux only; ignored on other platforms).
+    pub resource_limits: Option<ResourceLimits>,
+    /// File to redirect child stderr to. When `None`, stderr is inherited.
+    pub stderr_file: Option<std::fs::File>,
+    /// Request Landlock LSM on Linux (default product: true on Linux).
+    ///
+    /// When true and the kernel cannot enforce Landlock, spawn fails unless
+    /// [`Self::allow_degraded_security`] is set (K22).
+    pub landlock: bool,
+    /// If true, missing Landlock (when requested) degrades instead of failing.
+    pub allow_degraded_security: bool,
+}
+
+/// Result of spawning a shim process inside a sandbox.
+#[derive(Debug)]
+pub struct SpawnResult {
+    /// The spawned child process.
+    pub child: Child,
+    /// cgroup guard — holds the cgroup alive; cleaned up on drop.
+    /// `None` on non-Linux platforms or when no resource limits are set.
+    #[cfg(target_os = "linux")]
+    #[allow(
+        dead_code,
+        reason = "RAII guard: held for lifetime, never read directly"
+    )]
+    pub cgroup: Option<bux_cgroup::CgroupGuard>,
+    /// Actual security posture for this spawn.
+    pub security: SecurityReport,
+}
+
+/// Spawn `bux-shim` inside a sandbox.
+///
+/// Applies platform-specific isolation, Landlock (when requested), then
+/// pre-exec hardening (FD cleanup, die-with-parent).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the process cannot be spawned,
+/// [`Error::Cgroup`] if resource limits cannot be applied,
+/// [`Error::LandlockUnavailable`] when Landlock is required but missing (K22),
+/// or [`Error::Landlock`] on ruleset construction failure.
+pub fn spawn(
+    shim: &Path,
+    config_path: &Path,
+    config: JailConfig,
+    vm_id: &str,
+) -> Result<SpawnResult> {
+    let (landlock_fd, landlock_status) = prepare_landlock(&config, shim, config_path)?;
+    let (mut cmd, sandbox_kind) = build_command(shim, config_path, &config);
+    cmd.stdin(Stdio::null());
+
+    let watchdog_fd = config.watchdog_fd;
+    let resource_limits = config.resource_limits;
+    if let Some(file) = config.stderr_file {
+        cmd.stderr(Stdio::from(file));
+    }
+
+    if let Some(fd) = watchdog_fd {
+        cmd.env(ENV_WATCHDOG_FD, fd.to_string());
+    }
+
+    pre_exec::apply(
+        &mut cmd,
+        pre_exec::PreserveFds {
+            watchdog: watchdog_fd,
+            landlock: landlock_fd,
+        },
+    );
+    let child = cmd.spawn()?;
+
+    #[cfg(target_os = "linux")]
+    let cgroup_guard = if let Some(ref limits) = resource_limits {
+        let guard = bux_cgroup::create(vm_id, limits)?;
+        #[allow(clippy::cast_possible_wrap, reason = "PID fits in i32")]
+        bux_cgroup::add_pid(&guard, child.id() as i32)?;
+        Some(guard)
+    } else {
+        let _ = vm_id;
+        None
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = (vm_id, resource_limits);
+
+    let mac = match sandbox_kind {
+        SandboxKind::Seatbelt => LayerStatus::Enforced,
+        SandboxKind::Bwrap | SandboxKind::Noop => {
+            if cfg!(target_os = "macos") {
+                LayerStatus::Disabled
+            } else {
+                LayerStatus::NotApplicable
+            }
+        }
+    };
+
+    Ok(SpawnResult {
+        child,
+        #[cfg(target_os = "linux")]
+        cgroup: cgroup_guard,
+        security: SecurityReport {
+            sandbox: sandbox_kind,
+            landlock: landlock_status,
+            mac,
+        },
+    })
+}
+
+/// Resolve Landlock fd + status (K22).
+///
+/// Returns [`Error::LandlockUnavailable`] / [`Error::Landlock`] on Linux when
+/// Landlock is requested and cannot be enforced (unless degraded is allowed).
+#[allow(
+    clippy::missing_const_for_fn,
+    clippy::unnecessary_wraps,
+    reason = "Result/errors only arise on Linux Landlock path; macOS always succeeds"
+)]
+fn prepare_landlock(
+    config: &JailConfig,
+    shim: &Path,
+    config_path: &Path,
+) -> Result<(Option<RawFd>, LayerStatus)> {
+    if !config.landlock {
+        return Ok((
+            None,
+            if cfg!(target_os = "linux") {
+                LayerStatus::Disabled
+            } else {
+                LayerStatus::NotApplicable
+            },
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match landlock_setup::build_fd(config, shim, config_path) {
+            Ok(Some(fd)) => Ok((Some(fd), LayerStatus::Enforced)),
+            Ok(None) => {
+                if config.allow_degraded_security {
+                    Ok((None, LayerStatus::Degraded))
+                } else {
+                    Err(Error::LandlockUnavailable)
+                }
+            }
+            Err(msg) => Err(Error::Landlock(msg)),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (shim, config_path);
+        // Requested on non-Linux: treat as not applicable (no fail).
+        Ok((None, LayerStatus::NotApplicable))
+    }
+}
+
+/// Build the sandboxed `Command` using the configured (or auto-detected) sandbox.
+fn build_command(
+    shim: &Path,
+    config_path: &Path,
+    config: &JailConfig,
+) -> (Command, SandboxKind) {
+    // Use explicit sandbox override if provided.
+    if let Some(ref sandbox) = config.sandbox
+        && let Some(cmd) = sandbox.wrap(shim, config_path, config)
+    {
+        return (cmd, sandbox.kind());
+    }
+
+    // Auto-detect platform sandbox.
+    if let Some((cmd, kind)) = platform_sandbox(shim, config_path, config) {
+        return (cmd, kind);
+    }
+
+    // Ultimate fallback: noop.
+    let mut cmd = Command::new(shim);
+    cmd.arg(config_path);
+    (cmd, SandboxKind::Noop)
+}
+
+/// Try the platform-native sandbox.
+fn platform_sandbox(
+    shim: &Path,
+    config_path: &Path,
+    config: &JailConfig,
+) -> Option<(Command, SandboxKind)> {
+    #[cfg(target_os = "linux")]
+    {
+        let sandbox = BwrapSandbox;
+        if let Some(cmd) = sandbox.wrap(shim, config_path, config) {
+            return Some((cmd, SandboxKind::Bwrap));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let sandbox = SeatbeltSandbox;
+        if let Some(cmd) = sandbox.wrap(shim, config_path, config) {
+            return Some((cmd, SandboxKind::Seatbelt));
+        }
+    }
+
+    let _ = (shim, config_path, config);
+    None
+}

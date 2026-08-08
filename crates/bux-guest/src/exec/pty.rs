@@ -67,9 +67,19 @@ pub fn spawn(req: &ExecStart) -> io::Result<PtyHandle> {
     let slave_stdout = dup_fd(&slave, "stdout")?;
     let slave_stderr = dup_fd(&slave, "stderr")?;
 
+    let credentials = super::resolve_credentials(req)?;
+
     let mut cmd = Command::new(&req.cmd);
     cmd.args(&req.args);
-    super::apply_exec_options!(&mut cmd, req);
+    // cwd/env only — credentials share one pre_exec with setsid below.
+    if let Some(ref cwd) = req.cwd {
+        cmd.current_dir(cwd);
+    }
+    for pair in &req.env {
+        if let Some((k, v)) = pair.split_once('=') {
+            cmd.env(k, v);
+        }
+    }
 
     unsafe {
         cmd.stdin(Stdio::from_raw_fd(slave_stdin.into_raw_fd()));
@@ -77,12 +87,21 @@ pub fn spawn(req: &ExecStart) -> io::Result<PtyHandle> {
         cmd.stderr(Stdio::from_raw_fd(slave_stderr.into_raw_fd()));
     }
 
-    // Create new session and set controlling terminal in the child.
+    // Single pre_exec: session + controlling TTY + optional credentials.
+    // (Command keeps only the last pre_exec hook.)
     unsafe {
         cmd.pre_exec(move || {
             nix::unistd::setsid().map_err(io::Error::other)?;
             if libc::ioctl(slave_raw_fd, libc::TIOCSCTTY, 0) == -1 {
                 return Err(io::Error::last_os_error());
+            }
+            if let Some((uid, gid)) = credentials {
+                if libc::setgid(gid) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::setuid(uid) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
             Ok(())
         });

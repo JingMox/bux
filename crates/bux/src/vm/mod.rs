@@ -27,11 +27,6 @@ impl Vm {
         Self { ctx }
     }
 
-    /// Returns the raw libkrun context ID.
-    pub(super) const fn ctx(&self) -> u32 {
-        self.ctx
-    }
-
     /// Returns the maximum number of vCPUs supported by the hypervisor.
     ///
     /// # Errors

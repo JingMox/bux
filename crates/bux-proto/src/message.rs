@@ -14,7 +14,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire protocol version. Bumped on every incompatible change.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// v7: [`ExecStart::user`] optional name-based user for guest `/etc/passwd` resolution.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Default chunk size for streaming transfers (1 MiB).
 pub const STREAM_CHUNK_SIZE: usize = 1 << 20;
@@ -171,6 +173,14 @@ pub struct ExecStart {
     pub tty: Option<TtyConfig>,
     /// Kill the process after this many milliseconds (`0` = no timeout).
     pub timeout_ms: u64,
+    /// Name-based user (`name`, `name:group`, or numeric string).
+    ///
+    /// Used when [`Self::uid`] / [`Self::gid`] are unset. Guest resolves via
+    /// `/etc/passwd` and `/etc/group` (protocol v7+).
+    ///
+    /// Always serialized (postcard has no field skipping); `None` is the default.
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 impl ExecStart {
@@ -187,6 +197,7 @@ impl ExecStart {
             stdin: false,
             tty: None,
             timeout_ms: 0,
+            user: None,
         }
     }
 
@@ -211,11 +222,21 @@ impl ExecStart {
         self
     }
 
-    /// Sets the UID and GID for execution.
+    /// Sets the UID and GID for execution (clears name-based [`Self::user`]).
     #[must_use]
-    pub const fn user(mut self, uid: u32, gid: u32) -> Self {
+    pub fn user(mut self, uid: u32, gid: u32) -> Self {
         self.uid = Some(uid);
         self.gid = Some(gid);
+        self.user = None;
+        self
+    }
+
+    /// Sets a name-based user for guest passwd resolution (clears numeric uid/gid).
+    #[must_use]
+    pub fn user_name(mut self, spec: impl Into<String>) -> Self {
+        self.user = Some(spec.into());
+        self.uid = None;
+        self.gid = None;
         self
     }
 

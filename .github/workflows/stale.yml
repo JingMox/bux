@@ -6,5 +6,5 @@ on:
   workflow_dispatch:
 
 jobs:
-  close-stale:
-    uses: qntx/workflows/.github/workflows/stale.yml@main
+  stale:
+    uses: qntx/workflows/.github/workflows/repo-stale.yml@main

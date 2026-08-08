@@ -25,7 +25,8 @@
 //! let config = NetworkConfig::new(
 //!     vec![(8080, 80), (8443, 443)],
 //!     PathBuf::from("/tmp/my-vm/net.sock"),
-//! );
+//! )
+//! .with_allow_net(vec!["example.com".into()]);
 //!
 //! let backend = GvproxyBackend::new(config)?;
 //! let endpoint = backend.endpoint()?;
@@ -40,3 +41,5 @@ pub mod socket;
 pub use backend::{ConnectionType, NetworkBackend, NetworkConfig, NetworkEndpoint, NetworkMetrics};
 pub use error::{NetError, Result};
 pub use gvproxy_backend::GvproxyBackend;
+// Re-export secret/CA types so callers need not depend on bux-gvproxy directly.
+pub use bux_gvproxy::{MitmCa, SecretConfig, generate_mitm_ca};

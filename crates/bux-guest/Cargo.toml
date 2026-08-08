@@ -11,8 +11,10 @@ publish = false
 bux-proto = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+futures = "0.3"
 libc = { workspace = true }
 nix = { workspace = true }
+rtnetlink = "0.14"
 tar = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "io-util", "process", "fs", "time", "sync", "signal"] }
 tokio-vsock = { workspace = true }

@@ -43,7 +43,9 @@ pub fn create() -> io::Result<(OwnedFd, Keepalive)> {
 }
 
 /// Name of the environment variable used to pass the watchdog FD to the shim.
-pub const ENV_WATCHDOG_FD: &str = "BUX_WATCHDOG_FD";
+///
+/// Same string as [`bux_jail::ENV_WATCHDOG_FD`] / [`bux_shim::ENV_WATCHDOG_FD`].
+pub const ENV_WATCHDOG_FD: &str = bux_shim::ENV_WATCHDOG_FD;
 
 /// Blocks the calling thread until `POLLHUP` is detected on the given FD.
 ///

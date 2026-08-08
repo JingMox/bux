@@ -1,7 +1,5 @@
 //! [`VmBuilder`] — fluent builder for configuring a micro-VM.
 
-use bux_krun::ctx as sys;
-
 use crate::disk::DiskFormat;
 use crate::error::Result;
 #[cfg(unix)]
@@ -51,10 +49,12 @@ pub struct VmBuilder {
     pub(super) env: Option<Vec<String>>,
     /// Working directory inside the VM.
     pub(super) workdir: Option<String>,
-    /// TCP port mappings (`"host_port:guest_port"`).
+    /// TCP port mappings (`"host_port:guest_port"` or ephemeral forms).
     pub(super) ports: Vec<String>,
-    /// virtio-fs shared directories `(tag, host_path)`.
-    pub(super) virtiofs: Vec<(String, String)>,
+    /// Egress allow-list (empty = unrestricted).
+    pub(super) allow_net: Vec<String>,
+    /// virtio-fs shared directories.
+    pub(super) virtiofs: Vec<crate::state::VirtioFs>,
     /// Global log level for libkrun.
     pub(super) log_level: Option<LogLevel>,
     /// UID to set before starting the VM.
@@ -71,6 +71,24 @@ pub struct VmBuilder {
     pub(super) console_output: Option<String>,
     /// vsock port mappings `(guest_port, host_socket_path, listen)`.
     pub(super) vsock_ports: Vec<(u32, String, bool)>,
+    /// Use gvproxy virtio-net (default `true` after network redesign).
+    pub(super) virtio_net: bool,
+    /// Host-only secrets for MITM (not serialised into `SQLite` values).
+    pub(crate) secrets: Vec<crate::secrets::Secret>,
+    /// Workload user string for Phase A (`uid[:gid]` or `name[:group]`).
+    pub(crate) workload_user: Option<String>,
+    /// Workload env already staged as product fields (merged into `workload_env`).
+    ///
+    /// When set, takes precedence over boot-style [`Self::env`] migration.
+    pub(crate) workload_env: Vec<String>,
+    /// Workload workdir for Phase A (takes precedence over [`Self::workdir`]).
+    pub(crate) workload_workdir: Option<String>,
+    /// Isolation policy (Landlock / jailer).
+    pub(crate) security: crate::security::SecurityOptions,
+    /// Auto-stop idle seconds (`None` = off).
+    pub(crate) auto_stop_secs: Option<u64>,
+    /// Auto-delete stopped idle seconds (`None` = off).
+    pub(crate) auto_delete_secs: Option<u64>,
 }
 
 impl VmBuilder {
@@ -88,6 +106,7 @@ impl VmBuilder {
             env: None,
             workdir: None,
             ports: Vec::new(),
+            allow_net: Vec::new(),
             virtiofs: Vec::new(),
             log_level: None,
             uid: None,
@@ -97,6 +116,14 @@ impl VmBuilder {
             snd_device: None,
             console_output: None,
             vsock_ports: Vec::new(),
+            virtio_net: true,
+            secrets: Vec::new(),
+            workload_user: None,
+            workload_env: Vec::new(),
+            workload_workdir: None,
+            security: crate::security::SecurityOptions::default(),
+            auto_stop_secs: None,
+            auto_delete_secs: None,
         }
     }
 
@@ -166,8 +193,22 @@ impl VmBuilder {
     }
 
     /// Adds a TCP port mapping in `"host_port:guest_port"` format.
+    /// Publish a TCP port.
+    ///
+    /// Formats: `host:guest`, `guest` / `0:guest` / `:guest` (ephemeral host),
+    /// optional `/tcp`. UDP is rejected at Runtime start.
     pub fn port(mut self, mapping: impl Into<String>) -> Self {
         self.ports.push(mapping.into());
+        self
+    }
+
+    /// Restrict egress to the given hosts/CIDRs (repeatable via multiple calls).
+    ///
+    /// Empty list (default) = **unrestricted** egress. Non-empty = allow-list
+    /// enforced by gvproxy DNS/TCP filters.
+    pub fn allow_net(mut self, hosts: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.allow_net
+            .extend(hosts.into_iter().map(Into::into));
         self
     }
 
@@ -176,7 +217,18 @@ impl VmBuilder {
     /// - `tag` — identifier used to mount the filesystem in the guest.
     /// - `host_path` — absolute path to the directory on the host.
     pub fn virtiofs(mut self, tag: impl Into<String>, host_path: impl Into<String>) -> Self {
-        self.virtiofs.push((tag.into(), host_path.into()));
+        self.virtiofs.push(crate::state::VirtioFs {
+            tag: tag.into(),
+            path: host_path.into(),
+            guest_path: String::new(),
+            read_only: false,
+        });
+        self
+    }
+
+    /// Adds a fully specified virtio-fs share (from volume resolution).
+    pub fn virtiofs_share(mut self, share: crate::state::VirtioFs) -> Self {
+        self.virtiofs.push(share);
         self
     }
 
@@ -231,10 +283,72 @@ impl VmBuilder {
         self
     }
 
+    /// Enable/disable gvproxy virtio-net (default **enabled**).
+    ///
+    /// When `true` (default): Runtime starts gvproxy, shim attaches virtio-net,
+    /// guest configures static eth0. When `false`: legacy TSI + no eth0 setup.
+    pub const fn virtio_net(mut self, enable: bool) -> Self {
+        self.virtio_net = enable;
+        self
+    }
+
+    /// Attach secrets for gvproxy MITM substitution (host-only values).
+    ///
+    /// Requires `virtio_net`. Guest traffic uses placeholders like
+    /// `<BUX_SECRET:name>`; real values never enter the guest.
+    pub fn secrets(mut self, secrets: impl IntoIterator<Item = crate::secrets::Secret>) -> Self {
+        self.secrets.extend(secrets);
+        self
+    }
+
+    /// Add one secret.
+    pub fn secret(mut self, secret: crate::secrets::Secret) -> Self {
+        self.secrets.push(secret);
+        self
+    }
+
+    /// Workload user for Phase A exec (`uid[:gid]` or `name[:group]`).
+    ///
+    /// Not applied as libkrun boot credentials on the managed path.
+    pub fn user(mut self, user: impl Into<String>) -> Self {
+        self.workload_user = Some(user.into());
+        self
+    }
+
+    /// Workload env for Phase A exec (`KEY=VALUE`).
+    pub fn workload_env(mut self, vars: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.workload_env = vars.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Workload working directory for Phase A exec.
+    pub fn workload_workdir(mut self, path: impl Into<String>) -> Self {
+        self.workload_workdir = Some(path.into());
+        self
+    }
+
+    /// Isolation policy (Landlock fail-closed by default on Linux — K22).
+    pub const fn security(mut self, opts: crate::security::SecurityOptions) -> Self {
+        self.security = opts;
+        self
+    }
+
+    /// Idle auto-stop policy in seconds (`None` = off).
+    pub const fn auto_stop_secs(mut self, secs: Option<u64>) -> Self {
+        self.auto_stop_secs = secs;
+        self
+    }
+
+    /// Idle auto-delete policy for stopped VMs (`None` = off).
+    pub const fn auto_delete_secs(mut self, secs: Option<u64>) -> Self {
+        self.auto_delete_secs = secs;
+        self
+    }
+
     /// Extracts a serializable configuration snapshot.
     #[cfg(unix)]
     pub(crate) fn to_config(&self) -> VmConfig {
-        use crate::state::{VirtioFs, VsockPort};
+        use crate::state::VsockPort;
         VmConfig {
             vcpus: self.vcpus,
             ram_mib: self.ram_mib,
@@ -247,14 +361,9 @@ impl VmBuilder {
             env: self.env.clone(),
             workdir: self.workdir.clone(),
             ports: self.ports.clone(),
-            virtiofs: self
-                .virtiofs
-                .iter()
-                .map(|(tag, path)| VirtioFs {
-                    tag: tag.clone(),
-                    path: path.clone(),
-                })
-                .collect(),
+            allow_net: self.allow_net.clone(),
+            published_ports: vec![],
+            virtiofs: self.virtiofs.clone(),
             vsock_ports: self
                 .vsock_ports
                 .iter()
@@ -271,13 +380,24 @@ impl VmBuilder {
             nested_virt: self.nested_virt,
             snd_device: self.snd_device,
             console_output: self.console_output.clone(),
+            virtio_net: self.virtio_net,
+            secrets_required: !self.secrets.is_empty(),
+            workload_env: self.workload_env.clone(),
+            workload_workdir: self.workload_workdir.clone(),
+            workload_user: self.workload_user.clone(),
+            security: self.security,
+            security_status: crate::security::SecurityStatus::default(),
             auto_remove: false,
+            auto_stop_secs: self.auto_stop_secs,
+            auto_delete_secs: self.auto_delete_secs,
+            last_activity_at: Some(std::time::SystemTime::now()),
+            last_error: None,
         }
     }
 
     /// Reconstructs a [`VmBuilder`] from a serialized [`VmConfig`].
     ///
-    /// Used by `bux-shim` to rebuild the VM in a child process.
+    /// Secrets are **not** restored (memory-only).
     #[cfg(unix)]
     pub fn from_config(c: &VmConfig) -> Self {
         Self {
@@ -292,11 +412,8 @@ impl VmBuilder {
             env: c.env.clone(),
             workdir: c.workdir.clone(),
             ports: c.ports.clone(),
-            virtiofs: c
-                .virtiofs
-                .iter()
-                .map(|v| (v.tag.clone(), v.path.clone()))
-                .collect(),
+            allow_net: c.allow_net.clone(),
+            virtiofs: c.virtiofs.clone(),
             vsock_ports: c
                 .vsock_ports
                 .iter()
@@ -309,79 +426,42 @@ impl VmBuilder {
             nested_virt: c.nested_virt,
             snd_device: c.snd_device,
             console_output: c.console_output.clone(),
+            virtio_net: c.virtio_net,
+            secrets: Vec::new(),
+            workload_user: c.workload_user.clone(),
+            workload_env: c.workload_env.clone(),
+            workload_workdir: c.workload_workdir.clone(),
+            security: c.security,
+            auto_stop_secs: c.auto_stop_secs,
+            auto_delete_secs: c.auto_delete_secs,
         }
     }
 
     /// Builds and returns the configured [`Vm`].
     ///
-    /// Creates a libkrun context and applies all configuration. If any step
-    /// fails, the context is automatically freed.
+    /// Creates a libkrun context via the shared [`bux_shim::prepare`] path
+    /// (same engine boundary as the `bux-shim` binary).
     ///
     /// # Errors
     ///
     /// Returns an error if context creation or any configuration step fails.
+    #[cfg(unix)]
     pub fn build(self) -> Result<Vm> {
-        let ctx = sys::create_ctx()?;
-        let vm = Vm::from_raw_ctx(ctx);
+        let product = self.to_config();
+        // Low-level build has no Runtime NetworkManager; virtio_net requires
+        // an external ShimNetwork (managed path only for now).
+        let shim = crate::shim_convert::to_shim_config("", &product, None);
+        let prepared = bux_shim::prepare(&shim)?;
+        Ok(Vm::from_raw_ctx(prepared.into_ctx()?))
+    }
 
-        if let Some(level) = self.log_level {
-            sys::set_log_level(level as u32)?;
-        }
-
-        sys::set_vm_config(vm.ctx(), self.vcpus, self.ram_mib)?;
-
-        if let Some(ref root) = self.root {
-            sys::set_root(vm.ctx(), root)?;
-        } else if let Some(ref disk) = self.root_disk {
-            let sys_fmt = match self.disk_format {
-                DiskFormat::Qcow2 => sys::DiskFormat::Qcow2,
-                _ => sys::DiskFormat::Raw,
-            };
-            sys::add_disk2(vm.ctx(), "rootfs", disk, sys_fmt, false)?;
-            sys::set_root_disk_remount(vm.ctx(), "/dev/vda", Some("ext4"), None)?;
-        }
-
-        for (tag, host_path) in &self.virtiofs {
-            sys::add_virtiofs(vm.ctx(), tag, host_path)?;
-        }
-
-        if !self.ports.is_empty() {
-            sys::set_port_map(vm.ctx(), &self.ports)?;
-        }
-
-        if let Some(ref workdir) = self.workdir {
-            sys::set_workdir(vm.ctx(), workdir)?;
-        }
-
-        if let Some(ref exec_path) = self.exec_path {
-            sys::set_exec(vm.ctx(), exec_path, &self.exec_args, self.env.as_deref())?;
-        } else if let Some(ref env) = self.env {
-            sys::set_env(vm.ctx(), env)?;
-        }
-
-        if let Some(uid) = self.uid {
-            sys::setuid(vm.ctx(), uid)?;
-        }
-        if let Some(gid) = self.gid {
-            sys::setgid(vm.ctx(), gid)?;
-        }
-        if !self.rlimits.is_empty() {
-            sys::set_rlimits(vm.ctx(), &self.rlimits)?;
-        }
-        if let Some(enable) = self.nested_virt {
-            sys::set_nested_virt(vm.ctx(), enable)?;
-        }
-        if let Some(enable) = self.snd_device {
-            sys::set_snd_device(vm.ctx(), enable)?;
-        }
-        if let Some(ref path) = self.console_output {
-            sys::set_console_output(vm.ctx(), path)?;
-        }
-        for (port, path, listen) in &self.vsock_ports {
-            sys::add_vsock_port2(vm.ctx(), *port, path, *listen)?;
-        }
-
-        Ok(vm)
+    /// Non-Unix stub — libkrun is Unix-only.
+    #[cfg(not(unix))]
+    pub fn build(self) -> Result<Vm> {
+        let _ = self;
+        Err(crate::Error::InvalidConfig(
+            "VmBuilder::build requires Unix".into(),
+        ))
     }
 }
 

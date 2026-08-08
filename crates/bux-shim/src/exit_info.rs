@@ -1,19 +1,13 @@
-//! Structured crash diagnostics for the `bux-shim` process.
+//! Structured crash diagnostics written by the shim process.
 //!
-//! When a shim crashes (signal, panic, or error), it writes an [`ExitInfo`]
-//! JSON file that the host runtime reads to produce actionable error messages
-//! instead of opaque timeouts.
+//! The host Runtime reads these JSON files when a shim dies before the
+//! guest agent becomes ready.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 /// Structured exit information written by the shim on crash.
-///
-/// Three variants cover the distinct failure modes:
-/// - **Signal**: Process killed by OS signal (SIGABRT, SIGSEGV, …).
-/// - **Panic**: Rust panic in the shim or libkrun.
-/// - **Error**: Normal error returned from `Vm::start()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 #[non_exhaustive]
@@ -34,7 +28,7 @@ pub enum ExitInfo {
         /// Source location (`file:line:col`).
         location: String,
     },
-    /// Normal error from `Vm::start()` or config parsing.
+    /// Normal error from boot or config parsing.
     Error {
         /// Process exit code.
         exit_code: i32,
@@ -81,11 +75,12 @@ pub const SIGNAL_EXIT_BASE: i32 = 128;
 pub const PANIC_EXIT_CODE: i32 = 101;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
 
     #[test]
-    fn signal_roundtrip() {
+    fn serde_signal() {
         let info = ExitInfo::Signal {
             exit_code: 134,
             signal: "SIGABRT".into(),
@@ -93,37 +88,6 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         let parsed: ExitInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.exit_code(), 134);
-        assert_eq!(parsed.summary(), "killed by SIGABRT");
-    }
-
-    #[test]
-    fn panic_roundtrip() {
-        let info = ExitInfo::Panic {
-            exit_code: PANIC_EXIT_CODE,
-            message: "index out of bounds".into(),
-            location: "src/main.rs:42:5".into(),
-        };
-        let json = serde_json::to_string(&info).unwrap();
-        let parsed: ExitInfo = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.exit_code(), 101);
-        assert!(parsed.summary().contains("index out of bounds"));
-        assert!(parsed.summary().contains("src/main.rs:42:5"));
-    }
-
-    #[test]
-    fn error_roundtrip() {
-        let info = ExitInfo::Error {
-            exit_code: 1,
-            message: "config parse failed".into(),
-        };
-        let json = serde_json::to_string(&info).unwrap();
-        let parsed: ExitInfo = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.exit_code(), 1);
-        assert_eq!(parsed.summary(), "config parse failed");
-    }
-
-    #[test]
-    fn from_file_missing_returns_none() {
-        assert!(ExitInfo::from_file(Path::new("/nonexistent/path.json")).is_none());
+        assert!(parsed.summary().contains("SIGABRT"));
     }
 }

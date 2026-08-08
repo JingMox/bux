@@ -30,8 +30,8 @@ pub struct GvproxyBackend {
 impl GvproxyBackend {
     /// Create a new gvproxy backend from a [`NetworkConfig`].
     ///
-    /// Spawns a background stats-logging task that holds only a `Weak`
-    /// reference, so it exits cleanly when the backend is dropped.
+    /// Stats logging is **opt-in** via [`NetworkConfig::stats_logging`]
+    /// (off by default — callers poll [`Self::get_stats`] when needed).
     ///
     /// # Errors
     ///
@@ -40,13 +40,27 @@ impl GvproxyBackend {
         tracing::debug!(
             socket_path = ?config.socket_path,
             port_mappings = ?config.port_mappings,
+            allow_net = ?config.allow_net,
+            secrets = config.secrets.len(),
             "creating gvisor-tap-vsock backend",
         );
 
-        let gv_config = GvproxyConfig::new(config.socket_path.clone(), config.port_mappings);
+        let mut gv_config = GvproxyConfig::new(config.socket_path.clone(), config.port_mappings)
+            .with_allow_net(config.allow_net);
+
+        if !config.secrets.is_empty() {
+            gv_config = gv_config.with_secrets(
+                config.secrets,
+                config.ca_cert_pem,
+                config.ca_key_pem,
+            );
+        }
+
         let instance = Arc::new(GvproxyInstance::new(&gv_config)?);
 
-        bux_gvproxy::start_stats_logging(Arc::downgrade(&instance));
+        if config.stats_logging {
+            bux_gvproxy::start_stats_logging(Arc::downgrade(&instance));
+        }
 
         let socket_path = config.socket_path;
         tracing::info!(
