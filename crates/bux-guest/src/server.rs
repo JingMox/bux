@@ -72,7 +72,7 @@ pub async fn run() -> io::Result<()> {
     }
 
     // Phase B: primary OCI container (before accepting host traffic).
-    crate::container::try_start_primary(boot.primary_container)?;
+    crate::container::try_start_primary(boot.primary_container);
     eprintln!(
         "[bux-guest] T+{}ms: workload isolation={}",
         uptime_ms(),

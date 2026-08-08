@@ -34,6 +34,7 @@ pub fn resolve_user(spec: &str) -> io::Result<(u32, u32)> {
     Ok((uid, gid))
 }
 
+/// Resolve a user part (numeric or name) to a uid.
 fn resolve_uid(part: &str) -> io::Result<u32> {
     let part = part.trim();
     if part.is_empty() {
@@ -48,6 +49,7 @@ fn resolve_uid(part: &str) -> io::Result<u32> {
     lookup_passwd_name(part).map(|(uid, _)| uid)
 }
 
+/// Resolve a group part (numeric or name) to a gid.
 fn resolve_gid(part: &str) -> io::Result<u32> {
     let part = part.trim();
     if part.is_empty() {
@@ -62,6 +64,7 @@ fn resolve_gid(part: &str) -> io::Result<u32> {
     lookup_group_name(part)
 }
 
+/// Look up uid and primary gid for a username in `/etc/passwd`.
 fn lookup_passwd_name(name: &str) -> io::Result<(u32, u32)> {
     for line in read_lines(Path::new("/etc/passwd"))? {
         // name:passwd:uid:gid:...
@@ -87,6 +90,7 @@ fn lookup_passwd_name(name: &str) -> io::Result<(u32, u32)> {
     ))
 }
 
+/// Look up the primary gid for a numeric uid in `/etc/passwd`.
 fn lookup_passwd_gid(uid: u32) -> Option<u32> {
     for line in read_lines(Path::new("/etc/passwd")).ok()? {
         let mut parts = line.split(':');
@@ -101,6 +105,7 @@ fn lookup_passwd_gid(uid: u32) -> Option<u32> {
     None
 }
 
+/// Look up a group name in `/etc/group` and return its gid.
 fn lookup_group_name(name: &str) -> io::Result<u32> {
     for line in read_lines(Path::new("/etc/group"))? {
         // name:passwd:gid:...
@@ -122,6 +127,7 @@ fn lookup_group_name(name: &str) -> io::Result<u32> {
     ))
 }
 
+/// Read non-empty, non-comment lines from a file.
 fn read_lines(path: &Path) -> io::Result<Vec<String>> {
     let data = fs::read_to_string(path)?;
     Ok(data

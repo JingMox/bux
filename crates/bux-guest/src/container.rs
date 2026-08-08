@@ -58,10 +58,10 @@ pub fn phase_b_ready() -> bool {
 }
 
 /// Start the primary container if requested. Failures are non-fatal (Phase A fallback).
-pub fn try_start_primary(enabled: bool) -> io::Result<()> {
+pub fn try_start_primary(enabled: bool) {
     if !enabled {
         eprintln!("[bux-guest] primary container disabled by boot config");
-        return Ok(());
+        return;
     }
     match start_primary() {
         Ok(pc) => {
@@ -71,17 +71,18 @@ pub fn try_start_primary(enabled: bool) -> io::Result<()> {
             } else {
                 eprintln!("[bux-guest] Phase B primary container ready (init_pid={pid})");
             }
-            Ok(())
         }
         Err(e) => {
             eprintln!("[bux-guest] Phase B primary container failed: {e}; continuing Phase A");
-            Ok(())
         }
     }
 }
 
 /// Whether this exec should run inside the primary container.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns an error if `in_container=true` but Phase B is not ready.
 pub fn should_use_container(in_container: Option<bool>) -> Result<bool, io::Error> {
     match in_container {
         Some(true) if !phase_b_ready() => Err(io::Error::other(
@@ -122,6 +123,7 @@ pub fn resolve_exec_argv(
     Ok(("nsenter".into(), ns_args))
 }
 
+/// Create the OCI bundle, start the primary container, and return its handle.
 fn start_primary() -> io::Result<PrimaryContainer> {
     let run = Path::new(RUN_BUX);
     let state_root = run.join("state");
@@ -143,7 +145,7 @@ fn start_primary() -> io::Result<PrimaryContainer> {
 
     let pid = container
         .pid()
-        .map(|p| i32::from(p.as_raw()))
+        .map(|p| p.as_raw())
         .ok_or_else(|| io::Error::other("primary container has no init pid after start"))?;
 
     Ok(PrimaryContainer {
@@ -153,6 +155,7 @@ fn start_primary() -> io::Result<PrimaryContainer> {
     })
 }
 
+/// Write `config.json` for a minimal long-lived primary container at `bundle`.
 fn write_oci_config(bundle: &Path) -> io::Result<()> {
     let pause = find_pause_binary()?;
     let args = pause_args(&pause);
@@ -214,6 +217,7 @@ fn write_oci_config(bundle: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Locate a sleep/pause binary suitable as container init.
 fn find_pause_binary() -> io::Result<String> {
     for candidate in [
         "/usr/bin/sleep",
@@ -238,6 +242,7 @@ fn find_pause_binary() -> io::Result<String> {
     ))
 }
 
+/// Map a displayable error into `io::Error::other`.
 fn io_map(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }

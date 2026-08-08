@@ -119,6 +119,7 @@ fn write_resolv_gateway() {
     );
 }
 
+/// Ensure `/etc/hosts` and hostname are set for the guest.
 fn ensure_hosts_and_hostname() {
     let hosts = std::path::Path::new("/etc/hosts");
     if !hosts.is_file() || fs::read_to_string(hosts).map_or(true, |c| c.is_empty()) {
