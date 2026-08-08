@@ -145,8 +145,8 @@ fn start_primary() -> io::Result<PrimaryContainer> {
 
     let pid = container
         .pid()
-        .map(|p| p.as_raw())
-        .ok_or_else(|| io::Error::other("primary container has no init pid after start"))?;
+        .ok_or_else(|| io::Error::other("primary container has no init pid after start"))?
+        .as_raw();
 
     Ok(PrimaryContainer {
         init_pid: pid,
