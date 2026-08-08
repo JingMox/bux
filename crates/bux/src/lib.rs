@@ -119,7 +119,9 @@ pub use metrics::{BoxMetrics, RuntimeMetrics};
 #[cfg(unix)]
 pub use options::{ImageRef, VmOptions};
 #[cfg(unix)]
-pub use process::{PHASE_A_LIMITS, apply_workload_defaults, merge_env, parse_numeric_user};
+pub use process::{
+    PHASE_A_LIMITS, PHASE_B_LIMITS, apply_workload_defaults, merge_env, parse_numeric_user,
+};
 pub use ports::{PortSpec, PublishedPort, BIND_ADDR, parse_publish_spec, resolve_ports};
 pub use security::{HostInfo, LayerStatus, SecurityOptions, SecurityStatus};
 #[cfg(unix)]

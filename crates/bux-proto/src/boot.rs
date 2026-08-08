@@ -31,6 +31,16 @@ pub struct GuestBootConfig {
     /// VM id for logs / diagnostics.
     #[serde(default)]
     pub vm_id: String,
+    /// Attempt to start the primary OCI container (Phase B) at agent boot.
+    ///
+    /// Default `true`. Failures fall back to Phase A without aborting the agent.
+    #[serde(default = "default_true")]
+    pub primary_container: bool,
+}
+
+/// Serde default for `primary_container`.
+const fn default_true() -> bool {
+    true
 }
 
 impl GuestBootConfig {
@@ -41,6 +51,7 @@ impl GuestBootConfig {
             network,
             mitm_ca_pem: None,
             vm_id: vm_id.into(),
+            primary_container: true,
         }
     }
 

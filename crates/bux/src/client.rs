@@ -47,6 +47,8 @@ pub struct PongInfo {
     pub version: String,
     /// Guest uptime in milliseconds.
     pub uptime_ms: u64,
+    /// Workload isolation: `phase_a` or `phase_b`.
+    pub workload_isolation: String,
 }
 
 /// Handle to a running exec with a dedicated connection.
@@ -350,7 +352,15 @@ impl Client {
         let mut stream = self.open_control().await?;
         bux_proto::send(&mut stream, &ControlReq::Ping).await?;
         match bux_proto::recv::<ControlResp>(&mut stream).await? {
-            ControlResp::Pong { version, uptime_ms } => Ok(PongInfo { version, uptime_ms }),
+            ControlResp::Pong {
+                version,
+                uptime_ms,
+                workload_isolation,
+            } => Ok(PongInfo {
+                version,
+                uptime_ms,
+                workload_isolation,
+            }),
             ControlResp::Error(e) => Err(io::Error::other(e)),
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "expected Pong")),
         }

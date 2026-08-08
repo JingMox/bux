@@ -10,8 +10,12 @@ use bux_proto::ExecStart;
 /// Human-readable Phase A security limits (surfaced on VM info / inspect).
 pub const PHASE_A_LIMITS: &str = "Phase A: workload processes share the guest rootfs and kernel \
 namespaces with the agent; concurrent execs are not mutually isolated; compromise of a workload \
-is compromise of the agent filesystem. Hardware boundary vs host still holds. Full container \
-isolation (libcontainer) is required for 1.0 (Phase B).";
+is compromise of the agent filesystem. Hardware boundary vs host still holds.";
+
+/// Human-readable Phase B note (primary OCI container + nsenter exec).
+pub const PHASE_B_LIMITS: &str = "Phase B: workloads exec into the primary OCI container namespaces \
+(via nsenter); agent remains outside as supervisor. Caps/user-ns/seccomp-in-guest still limited \
+versus full tenant containers; hardware boundary vs host still holds.";
 
 /// Merge environment lists as `KEY=VALUE`. Later entries override earlier keys.
 #[must_use]
