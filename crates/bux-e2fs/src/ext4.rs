@@ -588,13 +588,14 @@ pub fn create_from_dir(source_dir: &Path, output: &Path, size_bytes: u64) -> Res
 ///
 /// Returns an error if the image cannot be opened or the write fails.
 pub fn inject_file(image: &Path, host_file: &Path, guest_path: &str) -> Result<()> {
+    const EXT2_ET_DIR_EXISTS: i64 = 2_133_571_328 + 79;
     let mut fs = Filesystem::open(image)?;
     if let Some(parent) = Path::new(guest_path).parent() {
         let mut current_path = PathBuf::new();
         for component in parent {
             current_path.push(component);
             match fs.mkdir(&current_path.to_string_lossy()) {
-                Ok(()) | Err(Error::Ext2fs { code: 2_133_571_344, .. }) => {}
+                Ok(()) | Err(Error::Ext2fs { code: EXT2_ET_DIR_EXISTS, .. }) => {}
                 Err(e) => return Err(e),
             }
         }
