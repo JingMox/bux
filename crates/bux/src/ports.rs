@@ -87,15 +87,15 @@ pub fn parse_publish_spec(spec: &str) -> Result<PortSpec> {
 
     // ":80" or "0:80" or "8080:80" or "80"
     if let Some((host_s, guest_s)) = map.split_once(':') {
-        let guest: u16 = guest_s.parse().map_err(|_| {
-            crate::Error::InvalidConfig(format!("invalid guest port in {spec:?}"))
-        })?;
+        let guest: u16 = guest_s
+            .parse()
+            .map_err(|_| crate::Error::InvalidConfig(format!("invalid guest port in {spec:?}")))?;
         if host_s.is_empty() || host_s == "0" {
             return Ok(PortSpec::ephemeral(guest));
         }
-        let host: u16 = host_s.parse().map_err(|_| {
-            crate::Error::InvalidConfig(format!("invalid host port in {spec:?}"))
-        })?;
+        let host: u16 = host_s
+            .parse()
+            .map_err(|_| crate::Error::InvalidConfig(format!("invalid host port in {spec:?}")))?;
         if host == 0 {
             return Ok(PortSpec::ephemeral(guest));
         }
@@ -150,10 +150,7 @@ fn probe_ephemeral_port() -> Result<u16> {
 /// Format concrete pairs as legacy `"host:guest"` strings (TSI / storage).
 #[must_use]
 pub fn format_port_pairs(pairs: &[(u16, u16)]) -> Vec<String> {
-    pairs
-        .iter()
-        .map(|(h, g)| format!("{h}:{g}"))
-        .collect()
+    pairs.iter().map(|(h, g)| format!("{h}:{g}")).collect()
 }
 
 /// Parse stored `"host:guest"` list into concrete pairs (no ephemeral).
@@ -169,12 +166,12 @@ pub(crate) fn parse_concrete_port_strings(ports: &[String]) -> Result<Vec<(u16, 
                 "invalid port mapping {spec:?}; expected host:guest"
             )));
         };
-        let host: u16 = host_s.parse().map_err(|_| {
-            crate::Error::InvalidConfig(format!("invalid host port in {spec:?}"))
-        })?;
-        let guest: u16 = guest_s.parse().map_err(|_| {
-            crate::Error::InvalidConfig(format!("invalid guest port in {spec:?}"))
-        })?;
+        let host: u16 = host_s
+            .parse()
+            .map_err(|_| crate::Error::InvalidConfig(format!("invalid host port in {spec:?}")))?;
+        let guest: u16 = guest_s
+            .parse()
+            .map_err(|_| crate::Error::InvalidConfig(format!("invalid guest port in {spec:?}")))?;
         if host == 0 {
             return Err(crate::Error::InvalidConfig(format!(
                 "unresolved ephemeral port in stored mapping {spec:?}"

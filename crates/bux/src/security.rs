@@ -111,7 +111,10 @@ const fn map_layer(s: bux_jail::LayerStatus) -> LayerStatus {
 /// Host isolation capabilities for `Runtime::host_info` / `bux system info`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
-#[allow(clippy::struct_excessive_bools, reason = "independent capability flags")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent capability flags"
+)]
 pub struct HostInfo {
     /// KVM (Linux) or Hypervisor.framework (macOS).
     pub virtualization: bool,

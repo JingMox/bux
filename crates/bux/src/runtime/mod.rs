@@ -466,12 +466,9 @@ impl Runtime {
             let (pairs, published) = resolve_ports(&specs)?;
             config.ports = format_port_pairs(&pairs);
             config.published_ports = published;
-            let net = self.net.start(
-                &id,
-                pairs,
-                config.allow_net.clone(),
-                live_secrets.as_ref(),
-            )?;
+            let net =
+                self.net
+                    .start(&id, pairs, config.allow_net.clone(), live_secrets.as_ref())?;
             Some(net.shim_network)
         } else {
             let _ = parse_concrete_port_strings(&config.ports)?;

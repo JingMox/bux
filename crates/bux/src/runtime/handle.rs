@@ -20,7 +20,8 @@ use crate::events::{AuditEvent, AuditEventKind, EventDispatcher};
 use crate::metrics::{BoxMetrics, RuntimeMetrics};
 use crate::net_manager::NetworkManager;
 use crate::ports::{
-    format_port_pairs, parse_concrete_port_strings, parse_publish_spec, resolve_ports, PublishedPort,
+    PublishedPort, format_port_pairs, parse_concrete_port_strings, parse_publish_spec,
+    resolve_ports,
 };
 use crate::secrets::{LiveSecrets, StartOptions};
 use crate::snapshot::SnapshotManager;

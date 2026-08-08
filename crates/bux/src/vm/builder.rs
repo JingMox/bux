@@ -207,8 +207,7 @@ impl VmBuilder {
     /// Empty list (default) = **unrestricted** egress. Non-empty = allow-list
     /// enforced by gvproxy DNS/TCP filters.
     pub fn allow_net(mut self, hosts: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.allow_net
-            .extend(hosts.into_iter().map(Into::into));
+        self.allow_net.extend(hosts.into_iter().map(Into::into));
         self
     }
 

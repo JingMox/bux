@@ -485,10 +485,7 @@ impl StateDb {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn get_volume_by_name(
-        &self,
-        name: &str,
-    ) -> Result<Option<crate::volumes::VolumeInfo>> {
+    pub fn get_volume_by_name(&self, name: &str) -> Result<Option<crate::volumes::VolumeInfo>> {
         let conn = self.lock();
         conn.query_row(
             "SELECT id, name, path, created_at FROM volumes WHERE name = ?1",

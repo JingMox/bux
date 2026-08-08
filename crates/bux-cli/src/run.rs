@@ -327,13 +327,11 @@ impl RunArgs {
                 bux::StateDb::open(data.join("bux.db"))
                     .context("open state db for volume validation")?,
             );
-            let vol_mgr =
-                bux::VolumeManager::open(&data, db).context("open volume manager")?;
+            let vol_mgr = bux::VolumeManager::open(&data, db).context("open volume manager")?;
             let mut mounts = Vec::with_capacity(self.volume.len());
             for spec in &self.volume {
                 mounts.push(
-                    bux::parse_bind_spec(spec)
-                        .with_context(|| format!("invalid -v {spec:?}"))?,
+                    bux::parse_bind_spec(spec).with_context(|| format!("invalid -v {spec:?}"))?,
                 );
             }
             let resolved_vols = vol_mgr

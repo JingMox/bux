@@ -282,11 +282,7 @@ fn prepare_landlock(
 }
 
 /// Build the sandboxed `Command` using the configured (or auto-detected) sandbox.
-fn build_command(
-    shim: &Path,
-    config_path: &Path,
-    config: &JailConfig,
-) -> (Command, SandboxKind) {
+fn build_command(shim: &Path, config_path: &Path, config: &JailConfig) -> (Command, SandboxKind) {
     // Use explicit sandbox override if provided.
     if let Some(ref sandbox) = config.sandbox
         && let Some(cmd) = sandbox.wrap(shim, config_path, config)

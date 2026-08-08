@@ -63,16 +63,14 @@ mod net_manager;
 pub mod options;
 #[cfg(unix)]
 mod pipeline;
+pub mod ports;
 #[cfg(unix)]
 pub mod process;
-pub mod ports;
-pub mod security;
-#[cfg(unix)]
-pub mod volumes;
 #[cfg(unix)]
 mod runtime;
 #[cfg(unix)]
 pub mod secrets;
+pub mod security;
 #[cfg(unix)]
 mod shim_convert;
 #[cfg(unix)]
@@ -82,11 +80,21 @@ mod util;
 #[cfg(unix)]
 mod vm;
 #[cfg(unix)]
+pub mod volumes;
+#[cfg(unix)]
 pub mod watchdog;
 
 #[cfg(unix)]
+pub use bux_jail::checks::{HostCapabilities, audit_isolation, check_guest_binary, check_host};
+#[cfg(target_os = "linux")]
+pub use bux_jail::credentials::CredentialConfig;
+#[cfg(unix)]
+pub use bux_jail::{
+    JailConfig, NoopSandbox, ResourceLimits, Sandbox, SandboxCapabilities, SandboxKind,
+};
+#[cfg(unix)]
 pub use bux_krun::{Feature, KernelFormat, LogStyle, SyncMode};
-pub use bux_proto::{ExecStart, GuestBootConfig, GuestNetworkMode, GUEST_BOOT_CONFIG_ENV};
+pub use bux_proto::{ExecStart, GUEST_BOOT_CONFIG_ENV, GuestBootConfig, GuestNetworkMode};
 #[cfg(target_os = "linux")]
 pub use bux_seccomp::Error as SeccompError;
 #[cfg(unix)]
@@ -105,33 +113,21 @@ pub use events::{
 #[cfg(unix)]
 pub use health::{HealthCheckConfig, HealthCheckHandle};
 #[cfg(unix)]
-pub use bux_jail::checks::{HostCapabilities, audit_isolation, check_guest_binary, check_host};
-#[cfg(target_os = "linux")]
-pub use bux_jail::credentials::CredentialConfig;
-#[cfg(unix)]
-pub use bux_jail::{
-    JailConfig, NoopSandbox, ResourceLimits, Sandbox, SandboxCapabilities, SandboxKind,
-};
-#[cfg(unix)]
 pub use lifecycle::{RecoverAction, SECRETS_RESUPPLY_ERROR, SweepReport, recover_action};
 pub use log_level::{LogLevel, ParseLogLevelError};
 pub use metrics::{BoxMetrics, RuntimeMetrics};
 #[cfg(unix)]
 pub use options::{ImageRef, VmOptions};
+pub use ports::{BIND_ADDR, PortSpec, PublishedPort, parse_publish_spec, resolve_ports};
 #[cfg(unix)]
 pub use process::{
     PHASE_A_LIMITS, PHASE_B_LIMITS, apply_workload_defaults, merge_env, parse_numeric_user,
 };
-pub use ports::{PortSpec, PublishedPort, BIND_ADDR, parse_publish_spec, resolve_ports};
-pub use security::{HostInfo, LayerStatus, SecurityOptions, SecurityStatus};
-#[cfg(unix)]
-pub use volumes::{
-    VolumeInfo, VolumeManager, VolumeMount, VolumeSource, parse_bind_spec, validate_volume_name,
-};
-#[cfg(unix)]
-pub use secrets::{SECRET_PLACEHOLDER_PREFIX, Secret, StartOptions, default_placeholder};
 #[cfg(unix)]
 pub use runtime::{HealthStatus, RunOptions, Runtime, VmHandle, default_data_dir};
+#[cfg(unix)]
+pub use secrets::{SECRET_PLACEHOLDER_PREFIX, Secret, StartOptions, default_placeholder};
+pub use security::{HostInfo, LayerStatus, SecurityOptions, SecurityStatus};
 #[cfg(unix)]
 pub use snapshot::{SnapshotInfo, SnapshotManager};
 #[cfg(unix)]
@@ -139,6 +135,10 @@ pub use state::{BaseDiskRow, PRODUCT_SCHEMA_VERSION, SnapshotRow, StateDb};
 pub use state::{HealthState, Status, VirtioFs, VmConfig, VmState, VsockPort};
 #[cfg(unix)]
 pub use vm::{Vm, VmBuilder};
+#[cfg(unix)]
+pub use volumes::{
+    VolumeInfo, VolumeManager, VolumeMount, VolumeSource, parse_bind_spec, validate_volume_name,
+};
 
 /// Crash-diagnostics helpers shared with the shim (exit codes).
 #[cfg(unix)]

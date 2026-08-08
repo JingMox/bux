@@ -144,10 +144,7 @@ impl Error {
     /// Returns `true` if this is a transient error that may succeed on retry.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Busy(_) | Self::GuestUnavailable
-        )
+        matches!(self, Self::Busy(_) | Self::GuestUnavailable)
     }
 
     /// Returns `true` if this is a fatal error (runtime shut down).

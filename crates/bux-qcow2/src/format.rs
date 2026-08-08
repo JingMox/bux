@@ -96,7 +96,7 @@ impl fmt::Display for BackingFormat {
     clippy::indexing_slicing,
     reason = "bounds validated by callers before invocation"
 )]
-pub(crate) fn read_be_u32(buf: &[u8], offset: usize) -> u32 {
+pub(crate) const fn read_be_u32(buf: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes([
         buf[offset],
         buf[offset + 1],
@@ -115,7 +115,7 @@ pub(crate) fn read_be_u32(buf: &[u8], offset: usize) -> u32 {
     clippy::indexing_slicing,
     reason = "bounds validated by callers before invocation"
 )]
-pub(crate) fn read_be_u64(buf: &[u8], offset: usize) -> u64 {
+pub(crate) const fn read_be_u64(buf: &[u8], offset: usize) -> u64 {
     u64::from_be_bytes([
         buf[offset],
         buf[offset + 1],

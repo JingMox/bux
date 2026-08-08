@@ -358,11 +358,23 @@ const FEATURES: &[(Feature, &str)] = &[
 
 /// Environment variables that affect host capture / paths (documented for operators).
 const CAPTURE_ENV: &[(&str, &str)] = &[
-    ("BUX_HOME", "Runtime data directory (default: platform data dir / bux)"),
+    (
+        "BUX_HOME",
+        "Runtime data directory (default: platform data dir / bux)",
+    ),
     ("BUX_SHIM_PATH", "Override path to the bux-shim binary"),
-    ("BUX_GUEST_DIR", "Directory containing prebuilt bux-guest Linux binaries"),
-    ("BUX_GUEST_DOWNLOAD", "Set to 1 to fetch guest binary from release artifacts"),
-    ("PATH", "Used to locate bux-shim, bwrap, sandbox-exec, go (gvproxy build)"),
+    (
+        "BUX_GUEST_DIR",
+        "Directory containing prebuilt bux-guest Linux binaries",
+    ),
+    (
+        "BUX_GUEST_DOWNLOAD",
+        "Set to 1 to fetch guest binary from release artifacts",
+    ),
+    (
+        "PATH",
+        "Used to locate bux-shim, bwrap, sandbox-exec, go (gvproxy build)",
+    ),
 ];
 
 fn system_info(format: OutputFormat) -> Result<()> {

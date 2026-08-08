@@ -31,7 +31,10 @@ pub struct PrimaryContainer {
     /// Init process PID inside the guest (container init).
     pub init_pid: i32,
     /// libcontainer state root (retained for future exec/kill APIs).
-    #[allow(dead_code, reason = "state root reserved for full libcontainer exec path")]
+    #[allow(
+        dead_code,
+        reason = "state root reserved for full libcontainer exec path"
+    )]
     pub state_root: PathBuf,
     /// OCI bundle path (retained for lifecycle management).
     #[allow(dead_code, reason = "bundle path reserved for container delete/status")]

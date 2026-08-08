@@ -69,10 +69,7 @@ pub fn merge_image_config(
         };
     }
     if workload_workdir.is_none() {
-        *workload_workdir = img
-            .working_dir
-            .clone()
-            .filter(|w| !w.is_empty());
+        *workload_workdir = img.working_dir.clone().filter(|w| !w.is_empty());
     }
     if workload_user.is_none() {
         *workload_user = img.user.clone().filter(|u| !u.is_empty());
@@ -102,9 +99,7 @@ pub fn apply_workload_defaults(
     }
 
     let needs_user = req.uid.is_none() && req.gid.is_none() && req.user.is_none();
-    if needs_user
-        && let Some(spec) = workload_user.filter(|u| !u.is_empty())
-    {
+    if needs_user && let Some(spec) = workload_user.filter(|u| !u.is_empty()) {
         if let Some((uid, gid)) = parse_numeric_user(spec) {
             req = req.user(uid, gid);
         } else {
@@ -181,10 +176,9 @@ mod tests {
 
     #[test]
     fn merge_image_fills_empty_workload() {
-        let img: ImageConfig = serde_json::from_str(
-            r#"{"Env":["PATH=/usr/bin"],"WorkingDir":"/app","User":"1000"}"#,
-        )
-        .unwrap();
+        let img: ImageConfig =
+            serde_json::from_str(r#"{"Env":["PATH=/usr/bin"],"WorkingDir":"/app","User":"1000"}"#)
+                .unwrap();
         let mut env = vec!["EXTRA=1".into()];
         let mut wd = None;
         let mut user = None;

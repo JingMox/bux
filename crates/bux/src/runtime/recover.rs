@@ -214,11 +214,7 @@ impl Runtime {
 }
 
 /// Rebuild gvproxy for an orphaned virtio-net VM (no secrets).
-fn reattach_network_ports(
-    rt: &Runtime,
-    vm_id: &str,
-    config: &VmConfig,
-) -> crate::Result<()> {
+fn reattach_network_ports(rt: &Runtime, vm_id: &str, config: &VmConfig) -> crate::Result<()> {
     let mut specs = Vec::with_capacity(config.ports.len());
     for s in &config.ports {
         if let Ok(pair) = parse_concrete_one(s) {

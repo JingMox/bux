@@ -197,9 +197,9 @@ impl VolumeManager {
     ///
     /// Returns [`Error::NotFound`] if missing.
     pub fn get(&self, name: &str) -> Result<VolumeInfo> {
-        self.db.get_volume_by_name(name)?.ok_or_else(|| {
-            Error::NotFound(format!("volume '{name}' not found"))
-        })
+        self.db
+            .get_volume_by_name(name)?
+            .ok_or_else(|| Error::NotFound(format!("volume '{name}' not found")))
     }
 
     /// Remove a named volume (fails if still attached to a VM).
@@ -244,8 +244,7 @@ impl VolumeManager {
     pub fn link_vm(&self, vm_id: &str, resolved: &[ResolvedVolume]) -> Result<()> {
         for r in resolved {
             if let Some(ref vol_id) = r.volume_id {
-                self.db
-                    .insert_vm_volume(vm_id, vol_id, &r.guest_path)?;
+                self.db.insert_vm_volume(vm_id, vol_id, &r.guest_path)?;
             }
         }
         Ok(())
@@ -515,10 +514,11 @@ mod tests {
         let resolved = vm.resolve_mounts(&mounts).unwrap();
         let first = resolved.first().expect("one resolved mount");
         assert_eq!(first.guest_path, "/var/cache");
-        let root_canon = vm.root().canonicalize().unwrap_or_else(|_| vm.root().to_path_buf());
-        assert!(
-            first.host_path.starts_with(&root_canon) || first.host_path.starts_with(vm.root())
-        );
+        let root_canon = vm
+            .root()
+            .canonicalize()
+            .unwrap_or_else(|_| vm.root().to_path_buf());
+        assert!(first.host_path.starts_with(&root_canon) || first.host_path.starts_with(vm.root()));
         let vm_state = crate::state::VmState {
             id: "vm1".into(),
             name: None,

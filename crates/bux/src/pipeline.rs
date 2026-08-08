@@ -33,8 +33,7 @@ pub(crate) async fn create(
     validate(&opts)?;
 
     on_progress("resolving image");
-    let (builder_base, image_label, oci_cfg) =
-        resolve_image(rt, &opts.image, &on_progress).await?;
+    let (builder_base, image_label, oci_cfg) = resolve_image(rt, &opts.image, &on_progress).await?;
 
     // OCI ImageConfig fills gaps / bases env; product opts already on `opts` win.
     if let Some(ref img) = oci_cfg {
@@ -71,19 +70,9 @@ pub(crate) async fn create(
 
     on_progress("spawning shim");
     let handle = if opts.detach {
-        rt.spawn_detached(
-            &builder,
-            image_label,
-            opts.name.clone(),
-            opts.auto_remove,
-        )?
+        rt.spawn_detached(&builder, image_label, opts.name.clone(), opts.auto_remove)?
     } else {
-        rt.spawn(
-            &builder,
-            image_label,
-            opts.name.clone(),
-            opts.auto_remove,
-        )?
+        rt.spawn(&builder, image_label, opts.name.clone(), opts.auto_remove)?
     };
 
     if !resolved_vols.is_empty() {
@@ -204,8 +193,7 @@ pub(crate) async fn create_from_oci(
     validate(&opts)?;
 
     on_progress("resolving image");
-    let (builder, image_label, _oci_cfg) =
-        resolve_image(rt, &opts.image, &on_progress).await?;
+    let (builder, image_label, _oci_cfg) = resolve_image(rt, &opts.image, &on_progress).await?;
     let builder = configure(
         builder
             .vcpus(opts.vcpus)

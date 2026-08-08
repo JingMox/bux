@@ -43,9 +43,10 @@ impl PreparedVm {
     ///
     /// Returns [`Error::Krun`] if the FFI call fails before takeover.
     pub fn start(mut self) -> Result<()> {
-        let ctx = self.ctx.take().ok_or_else(|| {
-            Error::InvalidConfig("PreparedVm context already consumed".into())
-        })?;
+        let ctx = self
+            .ctx
+            .take()
+            .ok_or_else(|| Error::InvalidConfig("PreparedVm context already consumed".into()))?;
         match sys::start_enter(ctx) {
             Ok(()) => Ok(()),
             Err(e) => {

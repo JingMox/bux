@@ -181,20 +181,14 @@ impl VmOptions {
         host_path: impl Into<PathBuf>,
         guest_path: impl Into<String>,
     ) -> Self {
-        self.volumes
-            .push(VolumeMount::bind(host_path, guest_path));
+        self.volumes.push(VolumeMount::bind(host_path, guest_path));
         self
     }
 
     /// Attach a named volume at `guest_path` (convenience).
     #[must_use]
-    pub fn named_volume(
-        mut self,
-        name: impl Into<String>,
-        guest_path: impl Into<String>,
-    ) -> Self {
-        self.volumes
-            .push(VolumeMount::named(name, guest_path));
+    pub fn named_volume(mut self, name: impl Into<String>, guest_path: impl Into<String>) -> Self {
+        self.volumes.push(VolumeMount::named(name, guest_path));
         self
     }
 
@@ -311,9 +305,6 @@ mod tests {
     #[test]
     fn image_ref_from_str() {
         assert_eq!(ImageRef::from("x"), ImageRef::Oci("x".into()));
-        assert_eq!(
-            ImageRef::Rootfs("/tmp/r".into()).label(),
-            "/tmp/r"
-        );
+        assert_eq!(ImageRef::Rootfs("/tmp/r".into()).label(), "/tmp/r");
     }
 }

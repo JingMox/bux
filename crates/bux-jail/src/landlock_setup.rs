@@ -17,9 +17,7 @@ pub(crate) fn build_fd(
     config_path: &Path,
 ) -> Result<Option<std::os::fd::RawFd>, String> {
     let restrictions = path_restrictions(jail, shim, config_path);
-    restrictions
-        .build()
-        .map_err(|e| e.to_string())
+    restrictions.build().map_err(|e| e.to_string())
 }
 
 /// Assemble allow-lists matching bwrap binds + paths the shim needs.
@@ -28,7 +26,15 @@ fn path_restrictions(jail: &JailConfig, shim: &Path, config_path: &Path) -> Path
 
     // System trees the shim / bwrap / libkrun need (exist-only).
     for p in [
-        "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt", "/System", "/Library",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/etc",
+        "/opt",
+        "/System",
+        "/Library",
         "/Applications", // macOS n/a on Linux but harmless if missing
     ] {
         if Path::new(p).exists() {

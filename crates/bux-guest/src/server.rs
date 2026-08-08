@@ -4,9 +4,7 @@ use std::io;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use bux_proto::{
-    AGENT_PORT, GuestBootConfig, GuestNetworkMode, Hello, HelloAck, PROTOCOL_VERSION,
-};
+use bux_proto::{AGENT_PORT, GuestBootConfig, GuestNetworkMode, Hello, HelloAck, PROTOCOL_VERSION};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio_vsock::VsockListener;
 
@@ -55,7 +53,10 @@ pub async fn run() -> io::Result<()> {
         }
         GuestNetworkMode::Disabled => {
             network::configure_offline();
-            eprintln!("[bux-guest] T+{}ms: network disabled (offline)", uptime_ms());
+            eprintln!(
+                "[bux-guest] T+{}ms: network disabled (offline)",
+                uptime_ms()
+            );
         }
         _ => {
             return Err(io::Error::other(format!(

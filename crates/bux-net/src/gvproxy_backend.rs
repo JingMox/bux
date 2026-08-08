@@ -49,11 +49,8 @@ impl GvproxyBackend {
             .with_allow_net(config.allow_net);
 
         if !config.secrets.is_empty() {
-            gv_config = gv_config.with_secrets(
-                config.secrets,
-                config.ca_cert_pem,
-                config.ca_key_pem,
-            );
+            gv_config =
+                gv_config.with_secrets(config.secrets, config.ca_cert_pem, config.ca_key_pem);
         }
 
         let instance = Arc::new(GvproxyInstance::new(&gv_config)?);

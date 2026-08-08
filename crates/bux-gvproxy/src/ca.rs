@@ -7,7 +7,9 @@
 //! Persistence (load-or-generate to disk) is a Runtime concern; this module
 //! only mints PEMs.
 
-use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
+};
 use time::{Duration, OffsetDateTime};
 
 use crate::error::{Error, Result};

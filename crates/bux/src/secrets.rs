@@ -100,7 +100,10 @@ impl fmt::Debug for LiveSecrets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LiveSecrets")
             .field("secrets", &self.secrets)
-            .field("ca_cert_pem", &format!("<{} bytes>", self.ca_cert_pem.len()))
+            .field(
+                "ca_cert_pem",
+                &format!("<{} bytes>", self.ca_cert_pem.len()),
+            )
             .field("ca_key_pem", &"[REDACTED]")
             .finish()
     }
