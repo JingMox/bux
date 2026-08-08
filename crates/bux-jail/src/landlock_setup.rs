@@ -78,28 +78,31 @@ fn path_restrictions(jail: &JailConfig, shim: &Path, config_path: &Path) -> Path
     r
 }
 
+/// Allow `path` (and its parent directory when present) with the given access mode.
+///
+/// Parent is required so Landlock can traverse to the leaf path.
 fn allow_path_and_parent(
-    mut r: PathRestrictions,
+    mut restrictions: PathRestrictions,
     path: &Path,
     read_only: bool,
 ) -> PathRestrictions {
-    let add = |r: PathRestrictions, p: PathBuf| {
+    let add = |acc: PathRestrictions, p: PathBuf| {
         if read_only {
-            r.allow_read(p)
+            acc.allow_read(p)
         } else {
-            r.allow_read_write(p)
+            acc.allow_read_write(p)
         }
     };
     if path.exists() {
-        r = add(r, path.to_path_buf());
+        restrictions = add(restrictions, path.to_path_buf());
     }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
         && parent.exists()
     {
-        r = add(r, parent.to_path_buf());
+        restrictions = add(restrictions, parent.to_path_buf());
     }
-    r
+    restrictions
 }
 
 #[cfg(test)]
