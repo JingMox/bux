@@ -26,6 +26,10 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+mod ca_trust;
+#[cfg(target_os = "linux")]
+mod container;
+#[cfg(target_os = "linux")]
 mod control;
 #[cfg(target_os = "linux")]
 mod exec;
@@ -34,7 +38,11 @@ mod files;
 #[cfg(target_os = "linux")]
 mod mounts;
 #[cfg(target_os = "linux")]
+mod network;
+#[cfg(target_os = "linux")]
 mod server;
+#[cfg(target_os = "linux")]
+mod user;
 
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]

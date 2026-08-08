@@ -5,7 +5,9 @@
 //! `libgvproxy.a` static linkage, and the raw `extern "C"` FFI. On top
 //! of that it exposes a small, safe surface:
 //!
-//! - [`GvproxyConfig`] — the JSON payload the Go side consumes.
+//! - [`GvproxyConfig`] — the JSON payload the Go side consumes (topology,
+//!   `allow_net`, secrets, CA PEMs).
+//! - [`ca`] — ephemeral MITM CA minting (`rcgen`).
 //! - [`GvproxyInstance`] — RAII handle owning the Go-side resources.
 //! - [`NetworkStats`] / [`TcpStats`] — live counters decoded from JSON.
 //! - [`init_logging`] — Go `slog` → Rust `tracing` bridge (idempotent).
@@ -26,12 +28,13 @@
 //!     PathBuf::from("/tmp/my-vm/net.sock"),
 //!     vec![(8080, 80), (8443, 443)],
 //! );
-//! let instance = GvproxyInstance::new(config)?;
+//! let instance = GvproxyInstance::new(&config)?;
 //! let stats = instance.get_stats()?;
 //! eprintln!("bytes sent: {}", stats.bytes_sent);
 //! # Ok::<(), bux_gvproxy::Error>(())
 //! ```
 
+pub mod ca;
 pub mod config;
 pub mod constants;
 mod error;
@@ -40,7 +43,8 @@ mod instance;
 mod logging;
 pub mod stats;
 
-pub use config::{DnsZone, GvproxyConfig, PortMapping};
+pub use ca::{MitmCa, generate as generate_mitm_ca};
+pub use config::{DnsZone, GvproxyConfig, PortMapping, SecretConfig};
 pub use error::{Error, Result};
 pub use instance::{GvproxyInstance, start_stats_logging};
 pub use logging::init as init_logging;

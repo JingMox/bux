@@ -4,14 +4,16 @@ use std::io;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use bux_proto::{AGENT_PORT, Hello, HelloAck, PROTOCOL_VERSION};
+use bux_proto::{AGENT_PORT, GuestBootConfig, GuestNetworkMode, Hello, HelloAck, PROTOCOL_VERSION};
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio_vsock::VsockListener;
 
+use crate::ca_trust;
 use crate::control;
 use crate::exec;
 use crate::files;
 use crate::mounts;
+use crate::network;
 
 /// Boot timestamp, set once at agent startup.
 pub static BOOT_T0: OnceLock<Instant> = OnceLock::new();
@@ -22,7 +24,7 @@ pub fn uptime_ms() -> u64 {
     BOOT_T0.get().map_or(0, |t| t.elapsed().as_millis() as u64)
 }
 
-/// Entry point: mounts tmpfs, binds vsock, accepts connections.
+/// Entry point: mounts tmpfs, configures network from boot config, binds vsock.
 pub async fn run() -> io::Result<()> {
     BOOT_T0.set(Instant::now()).ok();
     eprintln!("[bux-guest] T+0ms: starting");
@@ -33,8 +35,49 @@ pub async fn run() -> io::Result<()> {
     mounts::mount_essential_tmpfs();
     eprintln!("[bux-guest] T+{}ms: tmpfs mounted", uptime_ms());
 
-    mounts::setup_network();
-    eprintln!("[bux-guest] T+{}ms: network configured", uptime_ms());
+    let boot = GuestBootConfig::from_env().map_err(io::Error::other)?;
+    eprintln!(
+        "[bux-guest] T+{}ms: boot config vm_id={} network={:?}",
+        uptime_ms(),
+        boot.vm_id,
+        boot.network
+    );
+
+    match boot.network {
+        GuestNetworkMode::Enabled => {
+            network::configure_static_eth0().await?;
+            eprintln!(
+                "[bux-guest] T+{}ms: static eth0 192.168.127.2/24 configured",
+                uptime_ms()
+            );
+        }
+        GuestNetworkMode::Disabled => {
+            network::configure_offline();
+            eprintln!(
+                "[bux-guest] T+{}ms: network disabled (offline)",
+                uptime_ms()
+            );
+        }
+        _ => {
+            return Err(io::Error::other(format!(
+                "unsupported GuestNetworkMode: {:?}",
+                boot.network
+            )));
+        }
+    }
+
+    if let Some(ref pem) = boot.mitm_ca_pem {
+        ca_trust::install_mitm_ca(pem)?;
+        eprintln!("[bux-guest] T+{}ms: MITM CA installed", uptime_ms());
+    }
+
+    // Phase B: primary OCI container (before accepting host traffic).
+    crate::container::try_start_primary(boot.primary_container);
+    eprintln!(
+        "[bux-guest] T+{}ms: workload isolation={}",
+        uptime_ms(),
+        crate::container::workload_isolation()
+    );
 
     let addr = tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, AGENT_PORT);
     let listener =

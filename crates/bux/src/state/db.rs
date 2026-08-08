@@ -1,14 +1,75 @@
 //! `SQLite` persistence layer for VM state.
+//!
+//! **Product schema only** — no migrations from pre-1.0 layouts.
+//! On version mismatch the open fails; delete the data directory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{HealthState, Status, VmState};
 use crate::error::{Error, Result};
 
-/// Persisted snapshot metadata.
+/// Product state-schema version (PRAGMA `user_version`).
+///
+/// Bump only on incompatible schema changes. There is **no** migration
+/// path — callers must wipe the data directory.
+///
+/// v2: named `volumes` + `vm_volumes` attachment tables (PR9).
+pub const PRODUCT_SCHEMA_VERSION: u32 = 2;
+
+/// DDL for a fresh product database.
+const PRODUCT_SCHEMA_SQL: &str = "
+CREATE TABLE vms (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT UNIQUE,
+    pid         INTEGER NOT NULL,
+    image       TEXT,
+    socket      TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'running',
+    health      TEXT NOT NULL DEFAULT 'unknown',
+    config      TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    updated_at  REAL
+);
+
+CREATE TABLE snapshots (
+    id          TEXT PRIMARY KEY NOT NULL,
+    box_id      TEXT NOT NULL REFERENCES vms(id) ON DELETE CASCADE,
+    name        TEXT,
+    disk_path   TEXT NOT NULL,
+    disk_bytes  INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL,
+    UNIQUE(box_id, name)
+);
+CREATE INDEX idx_snapshots_box ON snapshots(box_id);
+
+CREATE TABLE base_disks (
+    id          TEXT PRIMARY KEY NOT NULL,
+    digest      TEXT NOT NULL UNIQUE,
+    path        TEXT NOT NULL,
+    ref_count   INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL
+);
+
+CREATE TABLE volumes (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL UNIQUE,
+    path        TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
+
+CREATE TABLE vm_volumes (
+    vm_id       TEXT NOT NULL REFERENCES vms(id) ON DELETE CASCADE,
+    volume_id   TEXT NOT NULL REFERENCES volumes(id),
+    guest_path  TEXT NOT NULL,
+    PRIMARY KEY (vm_id, volume_id)
+);
+CREATE INDEX idx_vm_volumes_volume ON vm_volumes(volume_id);
+";
+
+/// Persisted snapshot metadata (disk-only; no memory snapshots).
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct SnapshotRow {
@@ -22,8 +83,6 @@ pub struct SnapshotRow {
     pub disk_path: String,
     /// Disk image size in bytes.
     pub disk_bytes: u64,
-    /// Whether this snapshot includes memory state.
-    pub memory: bool,
     /// When the snapshot was created.
     pub created_at: SystemTime,
 }
@@ -44,89 +103,6 @@ pub struct BaseDiskRow {
     pub created_at: SystemTime,
 }
 
-/// Resource quota limits for a tenant.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct QuotaRow {
-    /// Tenant identifier.
-    pub tenant: String,
-    /// Maximum number of VMs.
-    pub max_boxes: Option<i64>,
-    /// Maximum total disk usage in bytes.
-    pub max_disk_bytes: Option<i64>,
-    /// Maximum total vCPUs across all VMs.
-    pub max_vcpus: Option<i64>,
-    /// Maximum total RAM in MiB across all VMs.
-    pub max_ram_mib: Option<i64>,
-}
-
-/// Schema migration step.
-struct Migration {
-    /// Sequential version number.
-    version: u32,
-    /// SQL to apply for this migration.
-    sql: &'static str,
-}
-
-/// Ordered list of schema migrations. New migrations are appended here.
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        sql: "
-            CREATE TABLE IF NOT EXISTS vms (
-                id          TEXT PRIMARY KEY NOT NULL,
-                name        TEXT UNIQUE,
-                pid         INTEGER NOT NULL,
-                image       TEXT,
-                socket      TEXT NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'running',
-                config      TEXT NOT NULL,
-                created_at  REAL NOT NULL
-            );
-        ",
-    },
-    Migration {
-        version: 2,
-        sql: "
-            -- Tenant + health columns on existing vms table.
-            ALTER TABLE vms ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default';
-            ALTER TABLE vms ADD COLUMN health TEXT NOT NULL DEFAULT 'unknown';
-            ALTER TABLE vms ADD COLUMN updated_at REAL;
-
-            -- Snapshot table: point-in-time disk copies.
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id          TEXT PRIMARY KEY NOT NULL,
-                box_id      TEXT NOT NULL REFERENCES vms(id) ON DELETE CASCADE,
-                name        TEXT,
-                disk_path   TEXT NOT NULL,
-                disk_bytes  INTEGER NOT NULL DEFAULT 0,
-                memory      INTEGER NOT NULL DEFAULT 0,
-                created_at  REAL NOT NULL,
-                UNIQUE(box_id, name)
-            );
-            CREATE INDEX IF NOT EXISTS idx_snapshots_box ON snapshots(box_id);
-
-            -- Base disk tracking with reference counting.
-            CREATE TABLE IF NOT EXISTS base_disks (
-                id          TEXT PRIMARY KEY NOT NULL,
-                digest      TEXT NOT NULL UNIQUE,
-                path        TEXT NOT NULL,
-                ref_count   INTEGER NOT NULL DEFAULT 0,
-                created_at  REAL NOT NULL
-            );
-
-            -- Resource quotas per tenant.
-            CREATE TABLE IF NOT EXISTS quotas (
-                tenant          TEXT PRIMARY KEY NOT NULL,
-                max_boxes       INTEGER,
-                max_disk_bytes  INTEGER,
-                max_vcpus       INTEGER,
-                max_ram_mib     INTEGER
-            );
-        ",
-    },
-];
-
 /// SQLite-backed VM state database.
 ///
 /// Uses `Mutex<Connection>` to be safely `Send + Sync` without
@@ -138,15 +114,19 @@ pub struct StateDb {
 }
 
 impl StateDb {
-    /// Opens (or creates) the database at `path`, running pending migrations.
+    /// Opens (or creates) the product-schema database at `path`.
+    ///
+    /// Empty / new files get schema version [`PRODUCT_SCHEMA_VERSION`].
+    /// Existing files with any other `user_version` are **rejected**.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database cannot be opened or migrations fail.
+    /// Returns an error if the database cannot be opened, schema init fails,
+    /// or the on-disk schema version is unsupported.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        migrate(&conn)?;
+        ensure_product_schema(&conn)?;
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
         })
@@ -197,6 +177,20 @@ impl StateDb {
         self.lock().execute(
             "UPDATE vms SET status = ?1 WHERE id = ?2",
             params![status_str(status), id],
+        )?;
+        Ok(())
+    }
+
+    /// Rewrites the serialized config JSON for a VM (e.g. after restart security status).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or the database update fails.
+    pub fn update_config(&self, id: &str, config: &crate::state::VmConfig) -> Result<()> {
+        let config_json = serde_json::to_string(config)?;
+        self.lock().execute(
+            "UPDATE vms SET config = ?1 WHERE id = ?2",
+            params![config_json, id],
         )?;
         Ok(())
     }
@@ -315,15 +309,14 @@ impl StateDb {
     /// Returns an error if the database insert fails.
     pub fn insert_snapshot(&self, s: &SnapshotRow) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO snapshots (id, box_id, name, disk_path, disk_bytes, memory, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO snapshots (id, box_id, name, disk_path, disk_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 s.id,
                 s.box_id,
                 s.name,
                 s.disk_path,
                 i64::try_from(s.disk_bytes).unwrap_or(i64::MAX),
-                s.memory,
                 system_time_to_f64(s.created_at),
             ],
         )?;
@@ -339,7 +332,7 @@ impl StateDb {
         let conn = self.lock();
         Ok(conn
             .prepare(
-                "SELECT id, box_id, name, disk_path, disk_bytes, memory, created_at
+                "SELECT id, box_id, name, disk_path, disk_bytes, created_at
                  FROM snapshots WHERE box_id = ?1 ORDER BY created_at DESC",
             )?
             .query_map(params![box_id], row_to_snapshot)?
@@ -354,7 +347,7 @@ impl StateDb {
     pub fn get_snapshot(&self, snapshot_id: &str) -> Result<SnapshotRow> {
         let conn = self.lock();
         conn.query_row(
-            "SELECT id, box_id, name, disk_path, disk_bytes, memory, created_at
+            "SELECT id, box_id, name, disk_path, disk_bytes, created_at
              FROM snapshots WHERE id = ?1",
             params![snapshot_id],
             row_to_snapshot,
@@ -467,106 +460,151 @@ impl StateDb {
         Ok(())
     }
 
-    /// Sets quota limits for a tenant.
+    // ── volumes ──────────────────────────────────────────────────────────
+
+    /// Insert a named volume row.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database upsert fails.
-    pub fn set_quota(&self, q: &QuotaRow) -> Result<()> {
+    /// Returns an error if the insert fails (e.g. duplicate name).
+    pub fn insert_volume(&self, v: &crate::volumes::VolumeInfo) -> Result<()> {
         self.lock().execute(
-            "INSERT INTO quotas (tenant, max_boxes, max_disk_bytes, max_vcpus, max_ram_mib)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(tenant) DO UPDATE SET
-                max_boxes = excluded.max_boxes,
-                max_disk_bytes = excluded.max_disk_bytes,
-                max_vcpus = excluded.max_vcpus,
-                max_ram_mib = excluded.max_ram_mib",
+            "INSERT INTO volumes (id, name, path, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![
-                q.tenant,
-                q.max_boxes,
-                q.max_disk_bytes,
-                q.max_vcpus,
-                q.max_ram_mib
+                v.id,
+                v.name,
+                v.path.to_string_lossy(),
+                system_time_to_f64(v.created_at),
             ],
         )?;
         Ok(())
     }
 
-    /// Gets quota limits for a tenant.
+    /// Look up a volume by name.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database query fails.
-    pub fn get_quota(&self, tenant: &str) -> Result<Option<QuotaRow>> {
-        let result = {
-            let conn = self.lock();
-            conn.query_row(
-                "SELECT tenant, max_boxes, max_disk_bytes, max_vcpus, max_ram_mib
-                 FROM quotas WHERE tenant = ?1",
-                params![tenant],
-                |row| {
-                    Ok(QuotaRow {
-                        tenant: row.get(0)?,
-                        max_boxes: row.get(1)?,
-                        max_disk_bytes: row.get(2)?,
-                        max_vcpus: row.get(3)?,
-                        max_ram_mib: row.get(4)?,
-                    })
-                },
-            )
-        };
-        match result {
-            Ok(q) => Ok(Some(q)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(Error::Db(e)),
-        }
+    /// Returns an error if the query fails.
+    pub fn get_volume_by_name(&self, name: &str) -> Result<Option<crate::volumes::VolumeInfo>> {
+        let conn = self.lock();
+        conn.query_row(
+            "SELECT id, name, path, created_at FROM volumes WHERE name = ?1",
+            params![name],
+            row_to_volume,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
-    /// Counts running VMs for a given tenant.
+    /// List all named volumes.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database query fails.
-    pub fn count_boxes_by_tenant(&self, tenant: &str) -> Result<i64> {
+    /// Returns an error if the query fails.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "stmt borrows conn; collect before drop"
+    )]
+    pub fn list_volumes(&self) -> Result<Vec<crate::volumes::VolumeInfo>> {
         let conn = self.lock();
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM vms WHERE tenant = ?1",
-            params![tenant],
+        let mut stmt =
+            conn.prepare("SELECT id, name, path, created_at FROM volumes ORDER BY name")?;
+        let out = stmt
+            .query_map([], row_to_volume)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    /// Delete a volume by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub fn delete_volume(&self, id: &str) -> Result<()> {
+        self.lock()
+            .execute("DELETE FROM volumes WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Count VMs attached to a volume.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn count_volume_attachments(&self, volume_id: &str) -> Result<i64> {
+        let n: i64 = self.lock().query_row(
+            "SELECT COUNT(*) FROM vm_volumes WHERE volume_id = ?1",
+            params![volume_id],
             |r| r.get(0),
-        )?)
+        )?;
+        Ok(n)
     }
 
-    /// Lists VMs filtered by tenant.
+    /// Record a VM↔volume attachment.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database query fails.
-    pub fn list_by_tenant(&self, tenant: &str) -> Result<Vec<VmState>> {
-        let conn = self.lock();
-        Ok(conn
-            .prepare("SELECT * FROM vms WHERE tenant = ?1 ORDER BY created_at DESC")?
-            .query_map(params![tenant], row_to_state)?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
+    /// Returns an error if the insert fails.
+    pub fn insert_vm_volume(&self, vm_id: &str, volume_id: &str, guest_path: &str) -> Result<()> {
+        self.lock().execute(
+            "INSERT OR REPLACE INTO vm_volumes (vm_id, volume_id, guest_path)
+             VALUES (?1, ?2, ?3)",
+            params![vm_id, volume_id, guest_path],
+        )?;
+        Ok(())
+    }
+
+    /// Remove all volume attachments for a VM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete fails.
+    pub fn delete_vm_volumes(&self, vm_id: &str) -> Result<()> {
+        self.lock()
+            .execute("DELETE FROM vm_volumes WHERE vm_id = ?1", params![vm_id])?;
+        Ok(())
     }
 }
 
-/// Runs all pending schema migrations inside a transaction.
-fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")?;
+/// Map a `volumes` table row into [`crate::volumes::VolumeInfo`].
+fn row_to_volume(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::volumes::VolumeInfo> {
+    Ok(crate::volumes::VolumeInfo {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        path: PathBuf::from(row.get::<_, String>(2)?),
+        created_at: f64_to_system_time(row.get(3)?),
+    })
+}
 
-    let current: u32 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-        [],
-        |r| r.get(0),
-    )?;
+/// Ensure product schema: init empty DB, or refuse foreign versions.
+fn ensure_product_schema(conn: &Connection) -> Result<()> {
+    let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
 
-    for m in MIGRATIONS.iter().filter(|m| m.version > current) {
-        conn.execute_batch(m.sql)?;
-        conn.execute(
-            "INSERT INTO schema_version (version) VALUES (?1)",
-            params![m.version],
+    if version == 0 {
+        // Distinguish brand-new DB vs legacy unversioned/migrated DB.
+        let has_vms: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='vms'",
+            [],
+            |r| r.get(0),
         )?;
+        if has_vms {
+            return Err(Error::InvalidConfig(format!(
+                "state database uses a legacy schema (user_version=0 with existing tables); \
+                 delete the bux data directory and recreate (product schema v{PRODUCT_SCHEMA_VERSION})"
+            )));
+        }
+        conn.execute_batch(PRODUCT_SCHEMA_SQL)?;
+        conn.pragma_update(None, "user_version", PRODUCT_SCHEMA_VERSION)?;
+        return Ok(());
     }
+
+    if version != PRODUCT_SCHEMA_VERSION {
+        return Err(Error::InvalidConfig(format!(
+            "state database schema version {version} is unsupported \
+             (need {PRODUCT_SCHEMA_VERSION}); delete the bux data directory and recreate"
+        )));
+    }
+
     Ok(())
 }
 
@@ -599,8 +637,7 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRow> {
         name: row.get(2)?,
         disk_path: row.get(3)?,
         disk_bytes: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
-        memory: row.get(5)?,
-        created_at: f64_to_system_time(row.get(6)?),
+        created_at: f64_to_system_time(row.get(5)?),
     })
 }
 

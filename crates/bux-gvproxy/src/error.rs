@@ -20,4 +20,8 @@ pub enum Error {
     /// Serialising or deserialising a config/stats JSON payload failed.
     #[error("gvproxy JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// MITM CA generation failed.
+    #[error("gvproxy MITM CA error: {0}")]
+    Ca(String),
 }

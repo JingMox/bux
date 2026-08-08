@@ -35,8 +35,6 @@ pub struct SnapshotInfo {
     pub disk_path: PathBuf,
     /// Size of the snapshot disk in bytes.
     pub disk_bytes: u64,
-    /// Whether this snapshot includes memory state.
-    pub memory: bool,
     /// When the snapshot was created.
     pub created_at: SystemTime,
 }
@@ -49,7 +47,6 @@ impl From<SnapshotRow> for SnapshotInfo {
             name: row.name,
             disk_path: PathBuf::from(&row.disk_path),
             disk_bytes: row.disk_bytes,
-            memory: row.memory,
             created_at: row.created_at,
         }
     }
@@ -116,7 +113,6 @@ impl SnapshotManager {
             name: name.map(ToOwned::to_owned),
             disk_path: dest.to_string_lossy().into_owned(),
             disk_bytes,
-            memory: false,
             created_at: SystemTime::now(),
         };
         self.db.insert_snapshot(&row)?;

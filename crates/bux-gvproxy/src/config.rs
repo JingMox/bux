@@ -2,7 +2,26 @@
 //!
 //! [`GvproxyConfig`] is serialized to JSON and passed across the FFI
 //! boundary to the Go `gvproxy_create()` function.
+//!
+//! **Field matrix (must stay in sync with `gvproxy-bridge/main.go`):**
+//!
+//! | Rust field | Go JSON tag | Notes |
+//! |------------|-------------|-------|
+//! | `socket_path` | `socket_path` | required |
+//! | `subnet` | `subnet` | |
+//! | `gateway_ip` / `gateway_mac` | same | |
+//! | `guest_ip` / `guest_mac` | same | |
+//! | `mtu` | `mtu` | |
+//! | `port_mappings` | `port_mappings` | `{host_port, guest_port}` |
+//! | `dns_zones` | `dns_zones` | |
+//! | `dns_search_domains` | `dns_search_domains` | |
+//! | `debug` | `debug` | |
+//! | `capture_file` | `capture_file` | omit empty |
+//! | `allow_net` | `allow_net` | omit empty; empty = full egress |
+//! | `secrets` | `secrets` | omit empty; requires CA PEMs |
+//! | `ca_cert_pem` / `ca_key_pem` | same | omit empty |
 
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -22,12 +41,39 @@ pub struct DnsZone {
 }
 
 /// A single port mapping entry.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PortMapping {
-    /// Host port to bind.
+    /// Host port to bind (always `0.0.0.0` on the Go side today).
     pub host_port: u16,
     /// Guest port to forward to.
     pub guest_port: u16,
+}
+
+/// Secret placeholder substitution config for MITM (host-side only).
+///
+/// Wire format matches Go `SecretConfig` in `mitm_replacer.go`.
+/// The real `value` is never logged: [`Debug`] redacts it.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SecretConfig {
+    /// Logical secret name (for host bookkeeping).
+    pub name: String,
+    /// Hostnames (SNI / Host header) this secret applies to.
+    pub hosts: Vec<String>,
+    /// Placeholder string that appears in guest traffic (e.g. `<BUX_SECRET:TOKEN>`).
+    pub placeholder: String,
+    /// Real secret value substituted on the host proxy — never sent into the guest.
+    pub value: String,
+}
+
+impl fmt::Debug for SecretConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretConfig")
+            .field("name", &self.name)
+            .field("hosts", &self.hosts)
+            .field("placeholder", &self.placeholder)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Complete configuration for a gvproxy virtual-network instance.
@@ -69,6 +115,25 @@ pub struct GvproxyConfig {
     /// Optional pcap file for packet capture (debugging with Wireshark).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_file: Option<String>,
+
+    /// Egress allow-list (hostnames / CIDRs). Empty means unrestricted egress.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_net: Vec<String>,
+
+    /// MITM secret substitutions. Empty means no MITM.
+    ///
+    /// When non-empty, [`Self::ca_cert_pem`] and [`Self::ca_key_pem`] must also
+    /// be set (generated via [`crate::ca::generate`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<SecretConfig>,
+
+    /// PEM-encoded MITM CA certificate (public). Empty when secrets unused.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ca_cert_pem: String,
+
+    /// PEM-encoded MITM CA private key. Empty when secrets unused.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ca_key_pem: String,
 }
 
 impl GvproxyConfig {
@@ -97,6 +162,10 @@ impl GvproxyConfig {
                 .collect(),
             debug: false,
             capture_file: None,
+            allow_net: Vec::new(),
+            secrets: Vec::new(),
+            ca_cert_pem: String::new(),
+            ca_key_pem: String::new(),
         };
 
         // Allow packet capture via environment variable.
@@ -141,6 +210,30 @@ impl GvproxyConfig {
         self.capture_file = Some(path);
         self
     }
+
+    /// Set egress allow-list rules. Empty = unrestricted egress.
+    #[must_use]
+    pub fn with_allow_net(mut self, allow_net: Vec<String>) -> Self {
+        self.allow_net = allow_net;
+        self
+    }
+
+    /// Attach MITM secrets and CA PEMs.
+    ///
+    /// Callers must supply a CA (see [`crate::ca::generate`]) whenever
+    /// `secrets` is non-empty; the Go side loads CA only when secrets exist.
+    #[must_use]
+    pub fn with_secrets(
+        mut self,
+        secrets: Vec<SecretConfig>,
+        ca_cert_pem: String,
+        ca_key_pem: String,
+    ) -> Self {
+        self.secrets = secrets;
+        self.ca_cert_pem = ca_cert_pem;
+        self.ca_key_pem = ca_key_pem;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +245,7 @@ impl GvproxyConfig {
 )]
 mod tests {
     use super::*;
+    use crate::ca;
 
     fn test_socket() -> PathBuf {
         PathBuf::from("/tmp/test-gvproxy.sock")
@@ -165,6 +259,10 @@ mod tests {
         assert_eq!(cfg.guest_ip, "192.168.127.2");
         assert_eq!(cfg.mtu, 1500);
         assert!(!cfg.debug);
+        assert!(cfg.allow_net.is_empty());
+        assert!(cfg.secrets.is_empty());
+        assert!(cfg.ca_cert_pem.is_empty());
+        assert!(cfg.ca_key_pem.is_empty());
     }
 
     #[test]
@@ -179,9 +277,11 @@ mod tests {
     fn builder_pattern() {
         let cfg = GvproxyConfig::new(test_socket(), vec![(8080, 80)])
             .with_debug(true)
-            .with_mtu(9000);
+            .with_mtu(9000)
+            .with_allow_net(vec!["example.com".into()]);
         assert!(cfg.debug);
         assert_eq!(cfg.mtu, 9000);
+        assert_eq!(cfg.allow_net, vec!["example.com".to_owned()]);
     }
 
     #[test]
@@ -191,6 +291,74 @@ mod tests {
         let de: GvproxyConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg.subnet, de.subnet);
         assert_eq!(cfg.socket_path, de.socket_path);
+    }
+
+    #[test]
+    fn empty_allow_net_and_secrets_omitted_from_json() {
+        let cfg = GvproxyConfig::new(test_socket(), vec![]);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !json.contains("allow_net"),
+            "empty allow_net must omit: {json}"
+        );
+        assert!(!json.contains("secrets"), "empty secrets must omit: {json}");
+        assert!(
+            !json.contains("ca_cert_pem"),
+            "empty ca_cert_pem must omit: {json}"
+        );
+        assert!(
+            !json.contains("ca_key_pem"),
+            "empty ca_key_pem must omit: {json}"
+        );
+    }
+
+    #[test]
+    fn allow_net_and_secrets_json_parity_with_go() {
+        let ca = ca::generate().unwrap();
+        let cfg = GvproxyConfig::new(test_socket(), vec![(8080, 80)])
+            .with_allow_net(vec!["api.example.com".into(), "10.0.0.0/8".into()])
+            .with_secrets(
+                vec![SecretConfig {
+                    name: "TOKEN".into(),
+                    hosts: vec!["api.example.com".into()],
+                    placeholder: "<BUX_SECRET:TOKEN>".into(),
+                    value: "super-secret".into(),
+                }],
+                ca.cert_pem.clone(),
+                ca.key_pem.clone(),
+            );
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        // Go tags (main.go / mitm_replacer.go)
+        assert!(json.contains("\"allow_net\""));
+        assert!(json.contains("api.example.com"));
+        assert!(json.contains("\"secrets\""));
+        assert!(json.contains("\"placeholder\""));
+        assert!(json.contains("<BUX_SECRET:TOKEN>"));
+        assert!(json.contains("\"ca_cert_pem\""));
+        assert!(json.contains("\"ca_key_pem\""));
+        assert!(json.contains("BEGIN CERTIFICATE"));
+        assert!(json.contains("BEGIN PRIVATE KEY") || json.contains("BEGIN EC PRIVATE KEY"));
+
+        let de: GvproxyConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.allow_net.len(), 2);
+        assert_eq!(de.secrets.len(), 1);
+        assert_eq!(de.secrets[0].value, "super-secret");
+        assert_eq!(de.ca_cert_pem, ca.cert_pem);
+        assert_eq!(de.ca_key_pem, ca.key_pem);
+    }
+
+    #[test]
+    fn secret_debug_redacts_value() {
+        let s = SecretConfig {
+            name: "TOKEN".into(),
+            hosts: vec!["h".into()],
+            placeholder: "p".into(),
+            value: "must-not-appear".into(),
+        };
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("REDACTED"));
+        assert!(!dbg.contains("must-not-appear"));
     }
 
     #[test]

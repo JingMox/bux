@@ -9,13 +9,17 @@ so that higher layers can consume a tiny, safe Rust API.
 
 | Item | Description |
 | --- | --- |
-| `GvproxyConfig` | JSON-serialised config sent to the Go side (subnet, ports, DNS zones, capture file, …) |
+| `GvproxyConfig` | JSON config for Go: topology, ports, `allow_net`, secrets, CA PEMs |
+| `SecretConfig` | MITM placeholder mapping (`name`, `hosts`, `placeholder`, `value`) |
+| `ca::generate` / `MitmCa` | Ephemeral ECDSA P-256 MITM CA (PEM) |
 | `GvproxyInstance` | RAII handle that owns the Go-side resources and releases them on drop |
 | `NetworkStats` / `TcpStats` | Live counters decoded from `gvproxy_get_stats` |
-| `start_stats_logging` | Optional background tokio task that logs stats every 30 s |
+| `start_stats_logging` | Opt-in background stats task (not started by default from `bux-net`) |
 | `init_logging` | Go `slog` → Rust `tracing` bridge (idempotent) |
 | `version()` | `libgvproxy.a` version string |
 | `constants` | Default subnet / gateway / guest IP & MAC values |
+
+**JSON parity:** Rust `GvproxyConfig` field names match `gvproxy-bridge/main.go` (`allow_net`, `secrets`, `ca_cert_pem`, `ca_key_pem`). Empty allow/secrets/CA omit from JSON.
 
 This crate intentionally does **not** depend on any bux trait (e.g.
 `NetworkBackend`); the `bux-net` crate layers that abstraction on top

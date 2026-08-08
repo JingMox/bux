@@ -13,8 +13,10 @@
     reason = "binary crate: CLI conventions differ from library lints"
 )]
 
+mod logs;
 mod run;
 mod vm;
+mod volume;
 
 use anyhow::Result;
 use bux::{Feature, Vm};
@@ -33,8 +35,16 @@ enum Command {
     /// Create and run a command in a new micro-VM.
     Run(Box<run::RunArgs>),
 
+    /// Create and start a managed VM without an initial command (print ID).
+    ///
+    /// Equivalent to `bux run -d IMAGE` with no command/entrypoint override.
+    Create(Box<run::CreateArgs>),
+
     /// Execute a command in a running VM.
     Exec(vm::ExecArgs),
+
+    /// Show shim stderr logs for a VM.
+    Logs(logs::LogsArgs),
 
     /// List VMs.
     #[command(visible_alias = "ls")]
@@ -104,12 +114,32 @@ enum Command {
         images: Vec<String>,
     },
 
-    /// Display system capabilities and libkrun feature support.
+    /// Display host isolation capabilities and libkrun feature support.
+    ///
+    /// Prefer `bux system info` (same output).
+    #[command(visible_alias = "system-info")]
     Info {
         /// Output format.
         #[arg(long, default_value = "table")]
         format: OutputFormat,
     },
+
+    /// Host / runtime system commands.
+    System {
+        #[command(subcommand)]
+        action: SystemAction,
+    },
+
+    /// Manage named volumes (`{data_dir}/volumes/`).
+    Volume {
+        #[command(subcommand)]
+        action: volume::VolumeAction,
+    },
+
+    /// Apply idle auto-stop / auto-delete policies (`Runtime::sweep`).
+    ///
+    /// Policies default off; set `auto_stop_secs` / `auto_delete_secs` on create.
+    Sweep,
 
     /// Manage ext4 disk images.
     Disk {
@@ -122,6 +152,17 @@ enum Command {
     Completion {
         /// Target shell.
         shell: Shell,
+    },
+}
+
+/// Subcommands for `bux system`.
+#[derive(Subcommand)]
+enum SystemAction {
+    /// Host capabilities, data dir, and documented capture env vars.
+    Info {
+        /// Output format.
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
     },
 }
 
@@ -191,7 +232,9 @@ impl Cli {
     async fn dispatch(self) -> Result<()> {
         match self.command {
             Command::Run(args) => args.run().await,
+            Command::Create(args) => args.run().await,
             Command::Exec(args) => vm::exec(args).await,
+            Command::Logs(ref args) => logs::logs(args),
             Command::Ps(ref args) => vm::ps(args),
             Command::Stop(args) => vm::stop(args).await,
             Command::Kill(ref args) => vm::kill(args),
@@ -209,7 +252,12 @@ impl Cli {
             Command::Pull { image } => pull(&image).await,
             Command::Images { format } => images(format),
             Command::Rmi { images } => rmi(&images),
-            Command::Info { format } => info(format),
+            Command::Info { format } => system_info(format),
+            Command::System { action } => match action {
+                SystemAction::Info { format } => system_info(format),
+            },
+            Command::Volume { action } => volume::dispatch(action),
+            Command::Sweep => sweep_cmd(),
             Command::Disk { action } => disk_cmd(action),
             Command::Completion { shell } => {
                 clap_complete::generate(shell, &mut Self::command(), "bux", &mut std::io::stdout());
@@ -308,37 +356,116 @@ const FEATURES: &[(Feature, &str)] = &[
     (Feature::VirglResourceMap2, "virgl-resource-map2"),
 ];
 
-fn info(format: OutputFormat) -> Result<()> {
-    let max_vcpus = Vm::max_vcpus()?;
+/// Environment variables that affect host capture / paths (documented for operators).
+const CAPTURE_ENV: &[(&str, &str)] = &[
+    (
+        "BUX_HOME",
+        "Runtime data directory (default: platform data dir / bux)",
+    ),
+    ("BUX_SHIM_PATH", "Override path to the bux-shim binary"),
+    (
+        "BUX_GUEST_DIR",
+        "Directory containing prebuilt bux-guest Linux binaries",
+    ),
+    (
+        "BUX_GUEST_DOWNLOAD",
+        "Set to 1 to fetch guest binary from release artifacts",
+    ),
+    (
+        "PATH",
+        "Used to locate bux-shim, bwrap, sandbox-exec, go (gvproxy build)",
+    ),
+];
+
+fn system_info(format: OutputFormat) -> Result<()> {
+    let max_vcpus = Vm::max_vcpus().ok();
     let supported: Vec<&str> = FEATURES
         .iter()
         .filter(|(f, _)| Vm::has_feature(*f).unwrap_or(false))
         .map(|(_, name)| *name)
         .collect();
     let nested = Vm::check_nested_virt().ok();
+    let host = bux::HostInfo::probe();
+    let data_dir = bux::default_data_dir();
+    let caps = bux::check_host();
+    let isolation = bux::audit_isolation(&caps);
 
     if matches!(format, OutputFormat::Json) {
+        let env: serde_json::Map<String, serde_json::Value> = CAPTURE_ENV
+            .iter()
+            .map(|(k, doc)| {
+                (
+                    (*k).to_owned(),
+                    serde_json::json!({
+                        "doc": doc,
+                        "set": std::env::var_os(k).is_some(),
+                    }),
+                )
+            })
+            .collect();
         let obj = serde_json::json!({
+            "data_dir": data_dir,
             "max_vcpus": max_vcpus,
             "features": supported,
             "nested_virt": nested,
+            "host": host,
+            "isolation_warnings": isolation,
+            "env": env,
+            "protocol_version": bux_proto::PROTOCOL_VERSION,
+            "phase_a_limits": bux::PHASE_A_LIMITS,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
         return Ok(());
     }
 
-    println!("max vCPUs: {max_vcpus}");
+    println!("data dir:     {}", data_dir.display());
+    if let Some(n) = max_vcpus {
+        println!("max vCPUs:    {n}");
+    }
     let label = if supported.is_empty() {
         "none"
     } else {
         &supported.join(", ")
     };
-    println!("features:  {label}");
+    println!("libkrun:      {label}");
     match nested {
-        Some(true) => println!("nested:    supported"),
-        Some(false) => println!("nested:    not supported"),
+        Some(true) => println!("nested virt:  supported"),
+        Some(false) => println!("nested virt:  not supported"),
         None => {}
     }
+    println!("virtualization: {}", yn(host.virtualization));
+    println!("namespaces:     {} (bwrap)", yn(host.namespaces));
+    println!("landlock:       {}", yn(host.landlock));
+    println!("seccomp:        {}", yn(host.seccomp));
+    println!("cgroups v2:     {}", yn(host.cgroups));
+    println!("MAC:            {}", yn(host.mandatory_access_control));
+    println!("protocol:       v{}", bux_proto::PROTOCOL_VERSION);
+    if !isolation.is_empty() {
+        println!("warnings:");
+        for w in &isolation {
+            println!("  - {w}");
+        }
+    }
+    println!("capture env:");
+    for (k, doc) in CAPTURE_ENV {
+        let mark = if std::env::var_os(k).is_some() {
+            "set"
+        } else {
+            "-"
+        };
+        println!("  {k:<20} [{mark}]  {doc}");
+    }
+    Ok(())
+}
+
+const fn yn(v: bool) -> &'static str {
+    if v { "yes" } else { "no" }
+}
+
+fn sweep_cmd() -> Result<()> {
+    let rt = vm::open_runtime()?;
+    let report = rt.sweep()?;
+    println!("stopped={} deleted={}", report.stopped, report.deleted);
     Ok(())
 }
 

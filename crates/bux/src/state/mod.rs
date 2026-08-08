@@ -113,6 +113,12 @@ pub struct VirtioFs {
     pub tag: String,
     /// Absolute host directory path.
     pub path: String,
+    /// Intended guest mount path (product metadata; guest may auto-mount later).
+    #[serde(default)]
+    pub guest_path: String,
+    /// Read-only preference (metadata; engine may still expose RW in v1).
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// A vsock port mapping.
@@ -127,10 +133,15 @@ pub struct VsockPort {
     pub listen: bool,
 }
 
+/// Default for [`VmConfig::virtio_net`] (gvproxy on).
+const fn default_virtio_net() -> bool {
+    true
+}
+
 /// Complete VM configuration — sufficient to reconstruct a [`crate::VmBuilder`].
 ///
-/// Serialized as JSON inside the `SQLite` `config` column and passed to
-/// `bux-shim` as a temp file so the child process can rebuild the VM.
+/// Serialized as JSON inside the `SQLite` `config` column. The shim receives
+/// a derived [`bux_shim::ShimConfig`], not this type directly.
 #[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmConfig {
@@ -169,9 +180,17 @@ pub struct VmConfig {
     #[serde(default)]
     pub workdir: Option<String>,
 
-    /// TCP port mappings (`"host:guest"`).
+    /// TCP port mappings as concrete `"host:guest"` after resolution.
     #[serde(default)]
     pub ports: Vec<String>,
+
+    /// Egress allow-list (hostnames / CIDRs). Empty = unrestricted egress.
+    #[serde(default)]
+    pub allow_net: Vec<String>,
+
+    /// Resolved published ports (set by Runtime after ephemeral probe).
+    #[serde(default)]
+    pub published_ports: Vec<crate::ports::PublishedPort>,
 
     /// virtio-fs shared directories.
     #[serde(default)]
@@ -202,9 +221,95 @@ pub struct VmConfig {
     #[serde(default)]
     pub console_output: Option<String>,
 
+    /// Use gvproxy virtio-net instead of libkrun TSI networking.
+    ///
+    /// **Default `true`**: Runtime starts gvproxy, shim attaches virtio-net,
+    /// guest configures static eth0. Set `false` for legacy TSI-only boots.
+    #[serde(default = "default_virtio_net")]
+    pub virtio_net: bool,
+
+    /// When true, restart requires secret re-supply (`StartOptions.secrets`)
+    /// if the Runtime process does not still hold memory-only secrets.
+    ///
+    /// Secret **values** are never stored in `SQLite`.
+    #[serde(default)]
+    pub secrets_required: bool,
+
+    /// Workload env defaults for Phase A exec (`KEY=VALUE`). Not VM boot env.
+    #[serde(default)]
+    pub workload_env: Vec<String>,
+
+    /// Workload working directory for Phase A exec. Not VM boot cwd.
+    #[serde(default)]
+    pub workload_workdir: Option<String>,
+
+    /// Workload user for Phase A (`uid[:gid]` or `name[:group]`).
+    ///
+    /// Applied at exec time (PR7); not libkrun boot credentials.
+    #[serde(default)]
+    pub workload_user: Option<String>,
+
+    /// Requested security policy (persisted; applied at each spawn/start).
+    #[serde(default)]
+    pub security: crate::security::SecurityOptions,
+
+    /// Actual security posture from the last successful spawn.
+    #[serde(default)]
+    pub security_status: crate::security::SecurityStatus,
+
     /// Remove VM state automatically when it stops.
     #[serde(default)]
     pub auto_remove: bool,
+
+    /// Stop the VM after this many seconds of inactivity (`None` = never). Default off.
+    #[serde(default)]
+    pub auto_stop_secs: Option<u64>,
+
+    /// Delete a stopped VM after this many seconds of inactivity (`None` = never). Default off.
+    #[serde(default)]
+    pub auto_delete_secs: Option<u64>,
+
+    /// Last activity timestamp (exec, start, create). Used by the idle sweeper.
+    #[serde(default, with = "crate::state::opt_system_time")]
+    pub last_activity_at: Option<SystemTime>,
+
+    /// Last fatal/recoverable error message (e.g. secrets re-supply required).
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+/// Serde helpers for `Option<SystemTime>` as optional f64 unix seconds.
+pub(crate) mod opt_system_time {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// Serialize optional activity timestamp as unix seconds.
+    #[allow(clippy::ref_option, reason = "serde with signature")]
+    pub(crate) fn serialize<S>(t: &Option<SystemTime>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match t {
+            Some(st) => {
+                let secs = st
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                Some(secs).serialize(s)
+            }
+            None => None::<f64>.serialize(s),
+        }
+    }
+
+    /// Deserialize optional activity timestamp from unix seconds.
+    pub(crate) fn deserialize<'de, D>(d: D) -> Result<Option<SystemTime>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v: Option<f64> = Option::deserialize(d)?;
+        Ok(v.map(|secs| UNIX_EPOCH + Duration::from_secs_f64(secs.max(0.0))))
+    }
 }
 
 /// Persisted state of a managed VM.
@@ -251,7 +356,7 @@ pub(crate) fn gen_id() -> String {
 mod db;
 
 #[cfg(unix)]
-pub use db::{BaseDiskRow, QuotaRow, SnapshotRow, StateDb};
+pub use db::{BaseDiskRow, PRODUCT_SCHEMA_VERSION, SnapshotRow, StateDb};
 
 #[cfg(test)]
 #[cfg(unix)]
@@ -288,6 +393,8 @@ mod tests {
                 env: None,
                 workdir: None,
                 ports: vec![],
+                allow_net: vec![],
+                published_ports: vec![],
                 virtiofs: vec![],
                 vsock_ports: vec![],
                 log_level: None,
@@ -297,7 +404,18 @@ mod tests {
                 nested_virt: None,
                 snd_device: None,
                 console_output: None,
+                virtio_net: true,
+                secrets_required: false,
+                workload_env: vec![],
+                workload_workdir: None,
+                workload_user: None,
+                security: crate::security::SecurityOptions::default(),
+                security_status: crate::security::SecurityStatus::default(),
                 auto_remove: false,
+                auto_stop_secs: None,
+                auto_delete_secs: None,
+                last_activity_at: None,
+                last_error: None,
             },
             created_at: SystemTime::now(),
         }
@@ -441,7 +559,6 @@ mod tests {
             name: Some("backup1".to_owned()),
             disk_path: "/tmp/snap1.qcow2".to_owned(),
             disk_bytes: 1024 * 1024,
-            memory: false,
             created_at: SystemTime::now(),
         };
         db.insert_snapshot(&snap).unwrap();
@@ -486,39 +603,6 @@ mod tests {
     }
 
     #[test]
-    fn quota_crud() {
-        let db = open_test_db();
-
-        assert!(db.get_quota("team-a").unwrap().is_none());
-
-        db.set_quota(&QuotaRow {
-            tenant: "team-a".to_owned(),
-            max_boxes: Some(10),
-            max_disk_bytes: Some(100 * 1024 * 1024 * 1024),
-            max_vcpus: Some(32),
-            max_ram_mib: Some(64 * 1024),
-        })
-        .unwrap();
-
-        let q = db.get_quota("team-a").unwrap().unwrap();
-        assert_eq!(q.max_boxes, Some(10));
-        assert_eq!(q.max_vcpus, Some(32));
-
-        // Upsert updates existing.
-        db.set_quota(&QuotaRow {
-            tenant: "team-a".to_owned(),
-            max_boxes: Some(20),
-            max_disk_bytes: None,
-            max_vcpus: None,
-            max_ram_mib: None,
-        })
-        .unwrap();
-        let q = db.get_quota("team-a").unwrap().unwrap();
-        assert_eq!(q.max_boxes, Some(20));
-        assert!(q.max_disk_bytes.is_none());
-    }
-
-    #[test]
     fn health_update() {
         let db = open_test_db();
         db.insert(&test_vm("vm1", None)).unwrap();
@@ -531,16 +615,11 @@ mod tests {
     }
 
     #[test]
-    fn tenant_filtering() {
+    fn product_schema_version() {
         let db = open_test_db();
-        db.insert(&test_vm("vm1", Some("a"))).unwrap();
-        db.insert(&test_vm("vm2", Some("b"))).unwrap();
-
-        // Both VMs default to 'default' tenant.
-        let all = db.list_by_tenant("default").unwrap();
-        assert_eq!(all.len(), 2);
-
-        assert_eq!(db.count_boxes_by_tenant("default").unwrap(), 2);
-        assert_eq!(db.count_boxes_by_tenant("other").unwrap(), 0);
+        // Fresh in-memory DB uses product schema.
+        assert_eq!(PRODUCT_SCHEMA_VERSION, 2);
+        db.insert(&test_vm("vm1", None)).unwrap();
+        assert_eq!(db.list().unwrap().len(), 1);
     }
 }

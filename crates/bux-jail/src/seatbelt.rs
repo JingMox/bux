@@ -7,7 +7,7 @@ use std::fmt::Write;
 use std::path::Path;
 use std::process::Command;
 
-use super::{JailConfig, Sandbox};
+use super::{JailConfig, Sandbox, SandboxCapabilities, SandboxKind};
 
 /// Path to the macOS sandbox-exec binary (pre-installed on all macOS versions).
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
@@ -33,6 +33,19 @@ impl Sandbox for SeatbeltSandbox {
         cmd.arg(config_path);
 
         Some(cmd)
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities {
+            namespaces: false,
+            seccomp: false,
+            mandatory_access_control: true,
+            cgroups: false,
+        }
+    }
+
+    fn kind(&self) -> SandboxKind {
+        SandboxKind::Seatbelt
     }
 }
 
@@ -90,9 +103,11 @@ fn generate_profile(shim: &Path, config_path: &Path, config: &JailConfig) -> Str
     // Allow read+write to root disk.
     if let Some(disk) = &config.root_disk {
         allow_readwrite(&mut p, &disk.to_string_lossy());
-        for backing_path in crate::disk::readonly_disk_paths(disk) {
-            allow_read(&mut p, &backing_path.to_string_lossy());
-        }
+    }
+
+    // Extra read-only paths (e.g. QCOW2 backing chain) supplied by Runtime.
+    for path in &config.readonly_paths {
+        allow_read(&mut p, &path.to_string_lossy());
     }
 
     // Allow read+write to virtiofs paths.

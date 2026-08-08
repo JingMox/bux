@@ -14,24 +14,35 @@ mod recover;
 /// Shim process spawning and lifecycle utilities.
 mod spawn;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use std::{fs, io};
 
 use bux_proto::AGENT_PORT;
 pub use handle::VmHandle;
 use nix::fcntl::{Flock, FlockArg};
-use spawn::{clean_vm_files, is_pid_alive, prepare_managed_config, spawn_shim};
+use spawn::{
+    clean_vm_files, inject_guest_boot_env, is_pid_alive, prepare_managed_config, spawn_shim,
+};
 use tracing::info;
 
 use crate::Result;
 use crate::disk::DiskManager;
 use crate::events::{AuditEvent, AuditEventKind, EventDispatcher};
 use crate::metrics::RuntimeMetrics;
+use crate::net_manager::NetworkManager;
+use crate::options::VmOptions;
+use crate::pipeline;
+use crate::ports::{
+    format_port_pairs, parse_concrete_port_strings, parse_publish_spec, resolve_ports,
+};
+use crate::secrets::LiveSecrets;
 use crate::snapshot::SnapshotManager;
 use crate::state::{self, StateDb, Status, VmState, VsockPort};
 use crate::vm::{Vm, VmBuilder};
+use crate::volumes::VolumeManager;
 
 /// VM health status returned by [`VmHandle::health`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +58,9 @@ pub enum HealthStatus {
     Dead,
 }
 
-/// Options for [`Runtime::run_opts`].
+/// Options for [`Runtime::run_image`].
+///
+/// Prefer [`VmOptions`] + [`Runtime::create`] for new code.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RunOptions {
@@ -70,13 +83,6 @@ impl Default for RunOptions {
     }
 }
 
-/// Global default runtime singleton.
-///
-/// **Deprecated**: prefer creating `Runtime` instances explicitly with
-/// [`Runtime::open()`] and managing their lifetime via `Arc<Runtime>`.
-/// This global will be removed in a future release.
-static DEFAULT_RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
 /// Returns the platform-default data directory for bux.
 ///
 /// Checks `$BUX_HOME` first, then falls back to platform conventions:
@@ -92,8 +98,8 @@ pub fn default_data_dir() -> PathBuf {
 
 /// Manages the lifecycle of bux micro-VMs.
 ///
-/// Integrates OCI image management, disk management, and VM state
-/// persistence in a single entry point. A file lock prevents multiple
+/// Integrates OCI image management, disk management, networking, and VM
+/// state persistence in a single entry point. A file lock prevents multiple
 /// `Runtime` instances from operating on the same data directory.
 #[derive(Debug)]
 pub struct Runtime {
@@ -109,6 +115,12 @@ pub struct Runtime {
     _lock: Flock<fs::File>,
     /// Snapshot manager.
     snapshots: SnapshotManager,
+    /// Per-VM gvproxy backends (`virtio_net` VMs).
+    net: Arc<NetworkManager>,
+    /// Memory-only secrets per VM (never `SQLite`).
+    secrets: Arc<Mutex<HashMap<String, LiveSecrets>>>,
+    /// Named volumes under `{data_dir}/volumes/`.
+    volumes: VolumeManager,
     /// Runtime-level metrics (atomic counters).
     metrics: Arc<RuntimeMetrics>,
     /// Audit event dispatcher.
@@ -150,6 +162,9 @@ impl Runtime {
         let disk = DiskManager::open(base)?;
         let oci = bux_oci::Oci::open_at(base)?;
         let snapshots = SnapshotManager::new(Arc::clone(&db), base)?;
+        let net = Arc::new(NetworkManager::new(socks_dir.clone()));
+        let secrets = Arc::new(Mutex::new(HashMap::new()));
+        let volumes = VolumeManager::open(base, Arc::clone(&db))?;
 
         let rt = Self {
             db,
@@ -158,6 +173,9 @@ impl Runtime {
             oci,
             _lock: lock,
             snapshots,
+            net,
+            secrets,
+            volumes,
             metrics: Arc::new(RuntimeMetrics::new()),
             events: Arc::new(EventDispatcher::new()),
         };
@@ -165,34 +183,6 @@ impl Runtime {
         rt.recover();
         info!(data_dir = %base.display(), "runtime opened");
         Ok(rt)
-    }
-
-    /// Returns the global default runtime, creating it on first call.
-    ///
-    /// Uses [`default_data_dir()`] for the data directory.
-    ///
-    /// # Deprecation
-    ///
-    /// **Prefer [`Runtime::open()`]** and manage the runtime lifetime
-    /// explicitly (e.g. via `Arc<Runtime>`). The global singleton prevents
-    /// multiple data directories and makes shutdown ordering implicit.
-    /// This method will be removed in a future release.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if runtime initialization fails (filesystem,
-    /// lock, database).
-    #[deprecated(since = "0.8.0", note = "use Runtime::open() instead")]
-    pub fn global() -> Result<&'static Self> {
-        if let Some(rt) = DEFAULT_RUNTIME.get() {
-            return Ok(rt);
-        }
-
-        drop(DEFAULT_RUNTIME.set(Self::open(default_data_dir())?));
-
-        // SAFETY: we just called .set() above; if another thread raced us,
-        // .get() still returns their value — either way it's Some.
-        Ok(DEFAULT_RUNTIME.get().unwrap_or_else(|| unreachable!()))
     }
 
     /// Returns a reference to the disk image manager.
@@ -210,6 +200,24 @@ impl Runtime {
         &self.snapshots
     }
 
+    /// Returns the network manager (gvproxy backends).
+    pub fn network(&self) -> &NetworkManager {
+        &self.net
+    }
+
+    /// Probe host isolation capabilities (KVM/HVF, bwrap, landlock, …).
+    #[must_use]
+    #[allow(clippy::unused_self, reason = "instance API for Runtime symmetry")]
+    pub fn host_info(&self) -> crate::security::HostInfo {
+        crate::security::HostInfo::probe()
+    }
+
+    /// Named volume manager (`{data_dir}/volumes/`).
+    #[must_use]
+    pub const fn volumes(&self) -> &VolumeManager {
+        &self.volumes
+    }
+
     /// Returns a reference to the runtime-level metrics.
     pub fn metrics(&self) -> &RuntimeMetrics {
         &self.metrics
@@ -221,26 +229,6 @@ impl Runtime {
     /// implementations that will receive audit events.
     pub fn events(&self) -> &EventDispatcher {
         &self.events
-    }
-
-    /// Sets resource quota limits for a tenant.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database update fails.
-    pub fn set_quota(&self, tenant: &str, quota: &state::QuotaRow) -> Result<()> {
-        self.db.set_quota(quota)?;
-        info!(tenant, "quota updated");
-        Ok(())
-    }
-
-    /// Returns the resource quota for a tenant, if configured.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database query fails.
-    pub fn get_quota(&self, tenant: &str) -> Result<Option<state::QuotaRow>> {
-        self.db.get_quota(tenant)
     }
 
     /// Returns the current total disk usage of all bases and overlays in bytes.
@@ -277,21 +265,6 @@ impl Runtime {
         Ok(removed)
     }
 
-    /// Checks that the tenant's quota allows creating another VM.
-    fn check_quota(&self, tenant: &str) -> Result<()> {
-        if let Some(quota) = self.db.get_quota(tenant)?
-            && let Some(max) = quota.max_boxes
-        {
-            let current = self.db.count_boxes_by_tenant(tenant)?;
-            if current >= max {
-                return Err(crate::Error::QuotaExceeded(format!(
-                    "tenant '{tenant}' already has {current}/{max} VMs"
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// Creates a new VM by cloning an existing VM's disk state.
     ///
     /// Flattens the source VM's QCOW2 overlay into a new standalone base
@@ -301,8 +274,8 @@ impl Runtime {
     /// The source VM can be running or stopped.
     /// # Errors
     ///
-    /// Returns an error if the source VM is not found, quota is exceeded,
-    /// disk flattening fails, or the spawn fails.
+    /// Returns an error if the source VM is not found, disk flattening fails,
+    /// or the spawn fails.
     pub fn clone_box(
         &self,
         source_id: &str,
@@ -310,8 +283,6 @@ impl Runtime {
         configure: impl FnOnce(VmBuilder) -> VmBuilder,
         opts: &RunOptions,
     ) -> Result<VmHandle> {
-        self.check_quota("default")?;
-
         let source = self.get(source_id)?;
         let source_state = source.state();
 
@@ -338,33 +309,45 @@ impl Runtime {
         Ok(handle)
     }
 
-    /// One-shot: pull image → create base disk → spawn VM with writable overlay.
+    /// Create and start a managed VM from product [`VmOptions`].
     ///
-    /// Flow: OCI pull → ext4 base image (cached by digest) → per-VM QCOW2
-    /// overlay → block-device boot. Each VM gets its own copy-on-write layer,
-    /// so `pip install`, `apt install`, etc. work out of the box.
+    /// Pipeline: validate → resolve image → base disk → network → shim → wait ready.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the image pull, disk creation, or spawn fails.
-    pub async fn run(
-        &self,
-        image: &str,
-        configure: impl FnOnce(VmBuilder) -> VmBuilder + Send,
-        name: Option<String>,
-    ) -> Result<VmHandle> {
-        self.run_opts(image, configure, name, &RunOptions::default(), |_| {})
-            .await
+    /// Returns an error if image resolution, disk, network, or spawn fails.
+    pub async fn create(&self, opts: VmOptions) -> Result<VmHandle> {
+        pipeline::create(self, opts, |_| {}).await
     }
 
-    /// Like [`run`](Self::run) but with explicit options and progress callback.
+    /// Like [`create`](Self::create) with a progress callback.
     ///
-    /// Checks tenant quota limits before creating the VM. Pass `tenant`
-    /// via [`RunOptions`] (defaults to `"default"`).
     /// # Errors
     ///
-    /// Returns an error if quota is exceeded, pull fails, disk creation
-    /// fails, or the spawn fails.
-    pub async fn run_opts(
+    /// Same as [`create`](Self::create).
+    pub async fn create_with(
+        &self,
+        opts: VmOptions,
+        on_progress: impl Fn(&str) + Send + Sync,
+    ) -> Result<VmHandle> {
+        pipeline::create(self, opts, on_progress).await
+    }
+
+    /// Alias for [`create`](Self::create) (ready wait is already part of create).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`create`](Self::create).
+    pub async fn run(&self, opts: VmOptions) -> Result<VmHandle> {
+        self.create(opts).await
+    }
+
+    /// OCI image + builder configure (prefer [`create`](Self::create)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if pull, disk, or spawn fails.
+    pub async fn run_image(
         &self,
         image: &str,
         configure: impl FnOnce(VmBuilder) -> VmBuilder + Send,
@@ -372,35 +355,16 @@ impl Runtime {
         opts: &RunOptions,
         on_progress: impl Fn(&str) + Send + Sync,
     ) -> Result<VmHandle> {
-        // Quota check: enforce max_boxes limit for the tenant.
-        self.check_quota("default")?;
-
-        let pull = self.oci.ensure(image, &on_progress).await?;
-
-        // Convert rootfs directory → ext4 base image (idempotent, cached by digest).
-        // Runs in spawn_blocking because ext4 creation is CPU-bound.
-        let base_path = {
-            let disk = self.disk.clone();
-            let rootfs = pull.rootfs.clone();
-            let digest = pull.digest.replace(':', "-");
-            let reference = pull.reference.clone();
-            tokio::task::spawn_blocking(move || -> Result<PathBuf> {
-                info!(image = %reference, "creating ext4 base image from rootfs");
-                disk.create_managed_base(&rootfs, &digest)
-            })
-            .await
-            .map_err(io::Error::other)??
-        };
-
-        let mut builder = Vm::builder().base_disk(base_path.to_string_lossy());
-
-        builder = configure(builder);
-        let handle = self.spawn(&builder, Some(image.to_owned()), name, opts.auto_remove)?;
-
-        if !opts.ready_timeout.is_zero() {
-            drop(handle.wait_ready(opts.ready_timeout).await);
-        }
-        Ok(handle)
+        pipeline::create_from_oci(
+            self,
+            image,
+            configure,
+            name,
+            opts.auto_remove,
+            opts.ready_timeout,
+            on_progress,
+        )
+        .await
     }
 
     /// Spawns a VM in a child process via `bux-shim` and returns a handle.
@@ -460,6 +424,8 @@ impl Runtime {
         let socket = self.socks_dir.join(format!("{id}.sock"));
         let socket_str = socket.to_string_lossy().into_owned();
 
+        // Secrets live on the builder only (not in VmConfig JSON values).
+        let staged_secrets = builder.secrets.clone();
         let mut config = builder.to_config();
         prepare_managed_config(&mut config)?;
         config.auto_remove = auto_remove;
@@ -478,8 +444,62 @@ impl Runtime {
             config.base_disk = None;
         }
 
+        let live_secrets = if staged_secrets.is_empty() {
+            config.secrets_required = false;
+            None
+        } else {
+            if !config.virtio_net {
+                return Err(crate::Error::SecretsNeedVirtioNet);
+            }
+            config.secrets_required = true;
+            Some(LiveSecrets::mint(staged_secrets)?)
+        };
+
+        let mitm_ca = live_secrets.as_ref().map(|l| l.ca_cert_pem.clone());
+        inject_guest_boot_env(&mut config, &id, mitm_ca)?;
+
+        let network = if config.virtio_net {
+            let mut specs = Vec::with_capacity(config.ports.len());
+            for s in &config.ports {
+                specs.push(parse_publish_spec(s)?);
+            }
+            let (pairs, published) = resolve_ports(&specs)?;
+            config.ports = format_port_pairs(&pairs);
+            config.published_ports = published;
+            let net =
+                self.net
+                    .start(&id, pairs, config.allow_net.clone(), live_secrets.as_ref())?;
+            Some(net.shim_network)
+        } else {
+            let _ = parse_concrete_port_strings(&config.ports)?;
+            config.published_ports.clear();
+            None
+        };
+
+        if let Some(live) = live_secrets {
+            self.secrets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.clone(), live);
+        }
+
         let config_path = self.socks_dir.join(format!("{id}.json"));
-        let shim = spawn_shim(&config, &config_path, &self.socks_dir, &id, watch_parent)?;
+        let shim = match spawn_shim(
+            &config,
+            &config_path,
+            &self.socks_dir,
+            &id,
+            watch_parent,
+            network,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                self.net.stop(&id);
+                return Err(e);
+            }
+        };
+
+        config.security_status = shim.security.clone();
 
         let vm_state = VmState {
             id: id.clone(),
@@ -493,7 +513,12 @@ impl Runtime {
         };
         self.db.insert(&vm_state)?;
 
-        info!(vm_id = %id, pid = shim.pid, "VM spawned");
+        info!(
+            vm_id = %id,
+            pid = shim.pid,
+            virtio_net = vm_state.config.virtio_net,
+            "VM spawned"
+        );
 
         self.metrics.on_box_created();
         self.events
@@ -511,6 +536,8 @@ impl Runtime {
             Arc::clone(&self.metrics),
             Arc::clone(&self.events),
             self.snapshots.clone(),
+            Arc::clone(&self.net),
+            Arc::clone(&self.secrets),
         ))
     }
 
@@ -566,6 +593,8 @@ impl Runtime {
             Arc::clone(&self.metrics),
             Arc::clone(&self.events),
             self.snapshots.clone(),
+            Arc::clone(&self.net),
+            Arc::clone(&self.secrets),
         ))
     }
 
@@ -606,6 +635,12 @@ impl Runtime {
         }
 
         clean_vm_files(&state.socket);
+        self.net.stop(&state.id);
+        self.secrets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&state.id);
+        drop(self.volumes.unlink_vm(&state.id));
         drop(self.disk.remove_vm_disk(&state.id));
         self.db.delete(&state.id)?;
         info!(vm_id = %state.id, "VM removed");

@@ -11,9 +11,12 @@ use nix::sys::signal;
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 
+use bux_jail::JailConfig;
+use bux_proto::{GUEST_BOOT_CONFIG_ENV, GuestBootConfig, GuestNetworkMode};
+use bux_shim::ShimNetwork;
+
 use crate::Result;
 use crate::guest::ManagedGuestBinary;
-use crate::jail::{self, JailConfig};
 use crate::state;
 use crate::watchdog::{self, Keepalive};
 
@@ -23,6 +26,8 @@ pub(super) struct ShimSpawnResult {
     pub pid: i32,
     /// Parent-side watchdog keepalive.
     pub keepalive: Option<Keepalive>,
+    /// Actual security posture from the jail spawn.
+    pub security: crate::security::SecurityStatus,
 }
 
 /// Builds a diagnostic message when the shim process dies before the guest agent is ready.
@@ -83,6 +88,11 @@ pub(super) fn wait_for_exit(pid: i32) {
 }
 
 /// Resolves the managed guest binary and validates the VM configuration for managed mode.
+///
+/// Boot-time `env` / `workdir` / `uid` / `gid` on the product config are **routed**
+/// into [`state::VmConfig::workload_*`] fields for Phase A exec defaults — they are
+/// not applied as libkrun boot identity. Guest boot env is re-injected later via
+/// [`inject_guest_boot_env`].
 pub(super) fn prepare_managed_config(config: &mut state::VmConfig) -> Result<()> {
     let guest = ManagedGuestBinary::resolve()?;
 
@@ -91,15 +101,6 @@ pub(super) fn prepare_managed_config(config: &mut state::VmConfig) -> Result<()>
     {
         return Err(crate::Error::InvalidConfig(
             "managed runtime no longer supports boot-time exec; start the VM, then run commands through bux exec".to_owned(),
-        ));
-    }
-    if config.workdir.is_some()
-        || config.uid.is_some()
-        || config.gid.is_some()
-        || config.env.as_ref().is_some_and(|env| !env.is_empty())
-    {
-        return Err(crate::Error::InvalidConfig(
-            "managed runtime options env/workdir/user now apply only to guest exec requests, not VM boot".to_owned(),
         ));
     }
     if config.root_disk.is_some() && config.rootfs.is_none() && config.base_disk.is_none() {
@@ -111,8 +112,11 @@ pub(super) fn prepare_managed_config(config: &mut state::VmConfig) -> Result<()>
         guest.inject_into_rootfs(Path::new(rootfs))?;
     }
 
+    route_workload_identity(config);
+
     config.exec_path = Some(ManagedGuestBinary::exec_path().to_owned());
     config.exec_args.clear();
+    // Boot env is set only by inject_guest_boot_env (BUX_GUEST_CONFIG).
     config.env = None;
     config.workdir = None;
     config.uid = None;
@@ -120,18 +124,82 @@ pub(super) fn prepare_managed_config(config: &mut state::VmConfig) -> Result<()>
     Ok(())
 }
 
+/// Move product identity fields into `workload_*` (Phase A exec defaults).
+///
+/// Existing `workload_*` values win over migrated boot-style fields.
+/// Entries for [`GUEST_BOOT_CONFIG_ENV`] are never treated as workload env
+/// (restart re-runs this after a previous `inject_guest_boot_env`).
+fn route_workload_identity(config: &mut state::VmConfig) {
+    if let Some(env) = config.env.take()
+        && config.workload_env.is_empty()
+    {
+        let prefix = format!("{GUEST_BOOT_CONFIG_ENV}=");
+        let workload: Vec<String> = env
+            .into_iter()
+            .filter(|e| !e.starts_with(&prefix))
+            .collect();
+        if !workload.is_empty() {
+            config.workload_env = workload;
+        }
+    }
+    if config.workload_workdir.is_none() {
+        config.workload_workdir = config.workdir.take();
+    }
+    if config.workload_user.is_none() {
+        match (config.uid, config.gid) {
+            (Some(u), Some(g)) => config.workload_user = Some(format!("{u}:{g}")),
+            (Some(u), None) => config.workload_user = Some(u.to_string()),
+            (None, Some(g)) => config.workload_user = Some(format!("0:{g}")),
+            (None, None) => {}
+        }
+    }
+}
+
+/// Inject `BUX_GUEST_CONFIG` for the guest agent (network mode + optional MITM CA).
+///
+/// Called after [`prepare_managed_config`] once the VM id is known.
+pub(super) fn inject_guest_boot_env(
+    config: &mut state::VmConfig,
+    vm_id: &str,
+    mitm_ca_pem: Option<String>,
+) -> Result<()> {
+    let mode = if config.virtio_net {
+        GuestNetworkMode::Enabled
+    } else {
+        GuestNetworkMode::Disabled
+    };
+    let mut boot = GuestBootConfig::new(vm_id, mode);
+    boot.mitm_ca_pem = mitm_ca_pem;
+    let entry = boot
+        .to_env_assignment()
+        .map_err(crate::Error::InvalidConfig)?;
+    config.env = Some(vec![entry]);
+    Ok(())
+}
+
 /// Writes config JSON, creates watchdog pipe, and spawns `bux-shim` inside a sandbox.
 ///
 /// Shared by [`super::Runtime::spawn()`] and [`super::VmHandle::start()`].
+///
+/// `network`: when `Some`, shim attaches virtio-net (gvproxy); when `None`, TSI ports.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::SecurityUnavailable`] when Landlock is required but missing (K22),
+/// or I/O / jail errors on spawn failure.
 pub(super) fn spawn_shim(
     config: &state::VmConfig,
     config_path: &Path,
     socks_dir: &Path,
     vm_id: &str,
     watch_parent: bool,
-) -> io::Result<ShimSpawnResult> {
-    let json =
-        serde_json::to_string(config).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    network: Option<ShimNetwork>,
+) -> Result<ShimSpawnResult> {
+    // Engine wire format is ShimConfig (not product VmConfig).
+    let shim_cfg = crate::shim_convert::to_shim_config(vm_id, config, network);
+    let json = shim_cfg
+        .to_json()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     fs::write(config_path, &json)?;
 
     // Capture shim stderr to a file for post-mortem diagnostics.
@@ -148,9 +216,24 @@ pub(super) fn spawn_shim(
     #[cfg(target_os = "macos")]
     ensure_shim_dylib_aliases(&shim)?;
 
+    let readonly_paths = config
+        .root_disk
+        .as_deref()
+        .map(|d| crate::disk::readonly_disk_paths(Path::new(d)))
+        .unwrap_or_default();
+
+    let sec = &config.security;
+    let sandbox: Option<Box<dyn bux_jail::Sandbox>> = if sec.jailer {
+        None // auto-detect bwrap/seatbelt
+    } else {
+        Some(Box::new(bux_jail::NoopSandbox::default()))
+    };
+
+    // Include net socket dir (same socks_dir) so bwrap/seatbelt can reach gvproxy.
     let jail_config = JailConfig {
         rootfs: config.rootfs.as_deref().map(PathBuf::from),
         root_disk: config.root_disk.as_deref().map(PathBuf::from),
+        readonly_paths,
         socks_dir: socks_dir.to_path_buf(),
         virtiofs_paths: config
             .virtiofs
@@ -160,18 +243,16 @@ pub(super) fn spawn_shim(
         watchdog_fd: shim_wd_fd
             .as_ref()
             .map(std::os::unix::io::AsRawFd::as_raw_fd),
-        sandbox: None,
+        sandbox,
         resource_limits: None,
         stderr_file: Some(stderr_file),
+        landlock: sec.landlock,
+        allow_degraded_security: sec.allow_degraded,
     };
 
-    let result = jail::spawn(&shim, config_path, jail_config, vm_id).map_err(|e| {
+    let result = bux_jail::spawn(&shim, config_path, jail_config, vm_id).map_err(|e| {
         drop(fs::remove_file(config_path));
-        let kind = match &e {
-            crate::Error::Io(io_err) => io_err.kind(),
-            _ => io::ErrorKind::Other,
-        };
-        io::Error::new(kind, format!("failed to spawn {}: {e}", shim.display()))
+        map_jail_error(e, &shim)
     })?;
 
     #[allow(
@@ -181,7 +262,31 @@ pub(super) fn spawn_shim(
     let pid = result.child.id() as i32;
     drop(shim_wd_fd);
 
-    Ok(ShimSpawnResult { pid, keepalive })
+    Ok(ShimSpawnResult {
+        pid,
+        keepalive,
+        security: crate::security::SecurityStatus::from_report(&result.security),
+    })
+}
+
+/// Map jail errors to product errors (preserve K22 fail-closed).
+fn map_jail_error(e: bux_jail::Error, shim: &Path) -> crate::Error {
+    match e {
+        bux_jail::Error::LandlockUnavailable => {
+            crate::Error::SecurityUnavailable(
+                "landlock required but unavailable on this kernel (set SecurityOptions.allow_degraded to proceed)"
+                    .into(),
+            )
+        }
+        bux_jail::Error::Landlock(msg) => {
+            crate::Error::SecurityUnavailable(format!("landlock ruleset failed: {msg}"))
+        }
+        bux_jail::Error::Io(io_err) => crate::Error::Io(io::Error::new(
+            io_err.kind(),
+            format!("failed to spawn {}: {io_err}", shim.display()),
+        )),
+        other => crate::Error::Jail(other),
+    }
 }
 
 /// Locates the `bux-shim` binary.
@@ -254,4 +359,96 @@ fn ensure_shim_dylib_aliases(shim: &Path) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "tests")]
+mod tests {
+    use super::*;
+    use crate::state::VmConfig;
+
+    fn empty_config() -> VmConfig {
+        VmConfig {
+            vcpus: 1,
+            ram_mib: 512,
+            rootfs: None,
+            root_disk: None,
+            disk_format: crate::disk::DiskFormat::default(),
+            base_disk: None,
+            exec_path: None,
+            exec_args: vec![],
+            env: None,
+            workdir: None,
+            ports: vec![],
+            allow_net: vec![],
+            published_ports: vec![],
+            virtiofs: vec![],
+            vsock_ports: vec![],
+            log_level: None,
+            uid: None,
+            gid: None,
+            rlimits: vec![],
+            nested_virt: None,
+            snd_device: None,
+            console_output: None,
+            virtio_net: true,
+            secrets_required: false,
+            workload_env: vec![],
+            workload_workdir: None,
+            workload_user: None,
+            security: crate::security::SecurityOptions::default(),
+            security_status: crate::security::SecurityStatus::default(),
+            auto_remove: false,
+            auto_stop_secs: None,
+            auto_delete_secs: None,
+            last_activity_at: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn route_migrates_env_workdir_user() {
+        let mut c = empty_config();
+        c.env = Some(vec!["FOO=bar".into(), "BAZ=1".into()]);
+        c.workdir = Some("/app".into());
+        c.uid = Some(1000);
+        c.gid = Some(1000);
+
+        route_workload_identity(&mut c);
+
+        assert_eq!(c.workload_env, vec!["FOO=bar", "BAZ=1"]);
+        assert_eq!(c.workload_workdir.as_deref(), Some("/app"));
+        assert_eq!(c.workload_user.as_deref(), Some("1000:1000"));
+        assert!(c.env.is_none());
+        assert!(c.workdir.is_none());
+    }
+
+    #[test]
+    fn route_skips_guest_boot_config_env() {
+        let mut c = empty_config();
+        c.env = Some(vec![format!("{GUEST_BOOT_CONFIG_ENV}={{\"vm_id\":\"x\"}}")]);
+        c.workload_env = vec!["KEEP=1".into()];
+
+        route_workload_identity(&mut c);
+
+        assert_eq!(c.workload_env, vec!["KEEP=1"]);
+        assert!(c.env.is_none());
+    }
+
+    #[test]
+    fn route_preserves_existing_workload() {
+        let mut c = empty_config();
+        c.env = Some(vec!["NEW=1".into()]);
+        c.workdir = Some("/new".into());
+        c.uid = Some(1);
+        c.workload_env = vec!["OLD=1".into()];
+        c.workload_workdir = Some("/old".into());
+        c.workload_user = Some("root".into());
+
+        route_workload_identity(&mut c);
+
+        assert_eq!(c.workload_env, vec!["OLD=1"]);
+        assert_eq!(c.workload_workdir.as_deref(), Some("/old"));
+        assert_eq!(c.workload_user.as_deref(), Some("root"));
+    }
 }

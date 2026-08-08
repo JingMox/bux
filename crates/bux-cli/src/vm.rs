@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::OutputFormat;
 
+#[must_use]
 pub fn apply_exec_options(
     mut req: bux::ExecStart,
     env: Vec<String>,
@@ -11,7 +12,7 @@ pub fn apply_exec_options(
     user: Option<&str>,
     interactive: bool,
     tty: bool,
-) -> Result<bux::ExecStart> {
+) -> bux::ExecStart {
     if !env.is_empty() {
         req = req.env(env);
     }
@@ -19,8 +20,12 @@ pub fn apply_exec_options(
         req = req.cwd(wd);
     }
     if let Some(user_spec) = user {
-        let (uid, gid) = crate::run::parse_user(user_spec)?;
-        req = req.user(uid, gid.unwrap_or(uid));
+        if let Some((uid, gid)) = bux::parse_numeric_user(user_spec) {
+            req = req.user(uid, gid);
+        } else {
+            // Name-based: guest resolves via /etc/passwd (protocol v7).
+            req = req.user_name(user_spec);
+        }
     }
     if interactive {
         req = req.with_stdin();
@@ -28,7 +33,7 @@ pub fn apply_exec_options(
     if tty {
         req = req.tty(24, 80);
     }
-    Ok(req)
+    req
 }
 
 pub async fn stream_exec_output(
@@ -391,7 +396,7 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
         args.user.as_deref(),
         args.interactive,
         args.tty,
-    )?;
+    );
 
     let output = stream_exec_output(handle.exec(req).await?, args.interactive).await?;
 
@@ -404,16 +409,32 @@ pub async fn exec(args: ExecArgs) -> Result<()> {
 #[cfg(unix)]
 pub fn inspect(args: &InspectArgs) -> Result<()> {
     let rt = open_runtime()?;
-    let states: Vec<_> = args
-        .targets
-        .iter()
-        .map(|t| rt.get(t).map(|h| h.state().clone()))
-        .collect::<std::result::Result<_, _>>()?;
+    let mut out = Vec::new();
+    for t in &args.targets {
+        let h = rt.get(t)?;
+        let s = h.state();
+        out.push(serde_json::json!({
+            "id": s.id,
+            "name": s.name,
+            "pid": s.pid,
+            "image": s.image,
+            "status": s.status,
+            "socket": s.socket,
+            "created_at": s.created_at,
+            "published_ports": h.published_ports(),
+            "allow_net": h.allow_net(),
+            "security": h.security_status(),
+            "security_options": h.security_options(),
+            "last_error": h.last_error(),
+            "phase_a_limits": h.phase_a_limits(),
+            "config": s.config,
+        }));
+    }
 
-    if states.len() == 1 {
-        println!("{}", serde_json::to_string_pretty(&states[0])?);
+    if out.len() == 1 {
+        println!("{}", serde_json::to_string_pretty(&out[0])?);
     } else {
-        println!("{}", serde_json::to_string_pretty(&states)?);
+        println!("{}", serde_json::to_string_pretty(&out)?);
     }
     Ok(())
 }

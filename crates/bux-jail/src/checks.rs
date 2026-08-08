@@ -23,6 +23,8 @@ pub struct HostCapabilities {
     pub mandatory_access_control: bool,
     /// Whether cgroup v2 resource limits are available.
     pub cgroups: bool,
+    /// Whether Landlock LSM is available (Linux 5.13+).
+    pub landlock: bool,
 }
 
 /// Checks what isolation capabilities are available on this host.
@@ -37,6 +39,7 @@ pub fn check_host() -> HostCapabilities {
         seccomp: check_seccomp(),
         mandatory_access_control: check_mac(),
         cgroups: check_cgroups(),
+        landlock: check_landlock(),
     }
 }
 
@@ -65,6 +68,12 @@ pub fn audit_isolation(caps: &HostCapabilities) -> Vec<String> {
     }
     if !caps.cgroups {
         warnings.push("cgroups v2 not available — no resource limits enforcement".to_owned());
+    }
+    if !caps.landlock {
+        warnings.push(
+            "Landlock LSM not available — filesystem restrictions degraded unless fail-closed"
+                .to_owned(),
+        );
     }
 
     warnings
@@ -184,6 +193,22 @@ fn check_cgroups() -> bool {
     }
 }
 
+/// Checks whether Landlock LSM is available.
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "Linux probes via non-const Ruleset APIs"
+)]
+fn check_landlock() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        bux_landlock::is_available()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Checks if a binary is available in $PATH.
 #[allow(dead_code, reason = "used conditionally on Linux")]
 fn which(name: &str) -> bool {
@@ -217,10 +242,12 @@ mod tests {
             seccomp: false,
             mandatory_access_control: false,
             cgroups: false,
+            landlock: false,
         };
         let warnings = audit_isolation(&caps);
-        assert!(warnings.len() >= 3);
+        assert!(warnings.len() >= 4);
         assert!(warnings.iter().any(|w| w.contains("namespace")));
+        assert!(warnings.iter().any(|w| w.contains("Landlock")));
     }
 
     #[test]

@@ -45,9 +45,17 @@ pub enum Error {
     #[error("guest agent unavailable")]
     GuestUnavailable,
 
-    /// A quota limit would be exceeded.
+    /// Secrets must be re-supplied via [`crate::StartOptions`] after Runtime restart.
+    #[error("secrets required: re-supply with start_with(StartOptions {{ secrets, .. }})")]
+    SecretsRequired,
+
+    /// Secrets were requested but virtio-net / gvproxy is disabled.
+    #[error("secrets require virtio_net (gvproxy MITM); enable virtio_net or omit secrets")]
+    SecretsNeedVirtioNet,
+
+    /// A requested security layer is unavailable and degraded mode is not allowed (K22).
     #[error("{0}")]
-    QuotaExceeded(String),
+    SecurityUnavailable(String),
 
     /// A `libkrun` FFI call failed or a string argument contained an
     /// interior NUL byte. Details are carried by [`bux_krun::Error`].
@@ -77,6 +85,21 @@ pub enum Error {
     #[cfg(unix)]
     #[error(transparent)]
     Cgroup(#[from] bux_cgroup::Error),
+
+    /// Jail / sandbox spawn error.
+    #[cfg(unix)]
+    #[error(transparent)]
+    Jail(#[from] bux_jail::Error),
+
+    /// Shim engine / `ShimConfig` apply error.
+    #[cfg(unix)]
+    #[error(transparent)]
+    Shim(#[from] bux_shim::Error),
+
+    /// Network backend (gvproxy) error.
+    #[cfg(unix)]
+    #[error(transparent)]
+    Net(#[from] bux_net::NetError),
 
     /// Seccomp BPF filter error (Linux-only).
     #[cfg(target_os = "linux")]
@@ -109,17 +132,19 @@ impl Error {
     pub const fn is_user_error(&self) -> bool {
         matches!(
             self,
-            Self::InvalidConfig(_) | Self::NotFound(_) | Self::Ambiguous(_) | Self::InvalidState(_)
+            Self::InvalidConfig(_)
+                | Self::NotFound(_)
+                | Self::Ambiguous(_)
+                | Self::InvalidState(_)
+                | Self::SecretsRequired
+                | Self::SecretsNeedVirtioNet
         )
     }
 
     /// Returns `true` if this is a transient error that may succeed on retry.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Busy(_) | Self::GuestUnavailable | Self::QuotaExceeded(_)
-        )
+        matches!(self, Self::Busy(_) | Self::GuestUnavailable)
     }
 
     /// Returns `true` if this is a fatal error (runtime shut down).
@@ -148,7 +173,7 @@ mod tests {
     fn retryable_errors() {
         assert!(Error::Busy("locked".into()).is_retryable());
         assert!(Error::GuestUnavailable.is_retryable());
-        assert!(Error::QuotaExceeded("disk".into()).is_retryable());
+        assert!(Error::SecretsRequired.is_user_error());
 
         assert!(!Error::GuestUnavailable.is_user_error());
         assert!(!Error::GuestUnavailable.is_fatal());

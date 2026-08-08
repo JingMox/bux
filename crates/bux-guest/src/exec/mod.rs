@@ -42,8 +42,27 @@ async fn handle_pipe(
 
     use tokio::process::Command;
 
-    let mut cmd = Command::new(&req.cmd);
-    cmd.args(&req.args)
+    let credentials = match resolve_credentials(&req) {
+        Ok(c) => c,
+        Err(e) => {
+            let err = ErrorInfo::new(ErrorCode::Internal, e.to_string());
+            bux_proto::send(w, &HelloAck::Error(err)).await?;
+            return w.flush().await;
+        }
+    };
+
+    let (program, args) =
+        match crate::container::resolve_exec_argv(&req.cmd, &req.args, req.in_container) {
+            Ok(v) => v,
+            Err(e) => {
+                let err = ErrorInfo::new(ErrorCode::Internal, e.to_string());
+                bux_proto::send(w, &HelloAck::Error(err)).await?;
+                return w.flush().await;
+            }
+        };
+
+    let mut cmd = Command::new(&program);
+    cmd.args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -51,7 +70,7 @@ async fn handle_pipe(
         cmd.stdin(Stdio::piped());
     }
 
-    apply_exec_options!(&mut cmd, &req);
+    apply_exec_options!(&mut cmd, &req, credentials);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -292,12 +311,33 @@ async fn send_exit_by_pid(
     .await
 }
 
-/// Applies common exec options (cwd, env, uid, gid) to a command.
+/// Resolved `(uid, gid)` for an exec, if any credential change is requested.
+pub(crate) type Credentials = Option<(u32, u32)>;
+
+/// Resolve numeric or name-based user for this exec.
+///
+/// Priority: explicit `uid`/`gid` on the request → `user` string (passwd) → none.
+pub(crate) fn resolve_credentials(req: &ExecStart) -> io::Result<Credentials> {
+    if req.uid.is_some() || req.gid.is_some() {
+        let uid = req.uid.or(req.gid).unwrap_or(0);
+        let gid = req.gid.or(req.uid).unwrap_or(uid);
+        return Ok(Some((uid, gid)));
+    }
+    if let Some(ref user) = req.user {
+        let (uid, gid) = crate::user::resolve_user(user)?;
+        return Ok(Some((uid, gid)));
+    }
+    Ok(None)
+}
+
+/// Applies common exec options (cwd, env, credentials) to a command.
 ///
 /// Works with both `std::process::Command` and `tokio::process::Command`
 /// since they share the same method signatures for env/cwd/pre_exec.
+///
+/// `$credentials` is [`Credentials`] from [`resolve_credentials`].
 macro_rules! apply_exec_options {
-    ($cmd:expr, $req:expr) => {{
+    ($cmd:expr, $req:expr, $credentials:expr) => {{
         if let Some(ref cwd) = $req.cwd {
             $cmd.current_dir(cwd);
         }
@@ -307,19 +347,12 @@ macro_rules! apply_exec_options {
             }
         }
         // Apply gid before uid — setuid would drop privilege to change gid.
-        if let Some(gid) = $req.gid {
+        if let Some((uid, gid)) = $credentials {
             unsafe {
                 $cmd.pre_exec(move || {
                     if libc::setgid(gid) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    Ok(())
-                });
-            }
-        }
-        if let Some(uid) = $req.uid {
-            unsafe {
-                $cmd.pre_exec(move || {
                     if libc::setuid(uid) != 0 {
                         return Err(std::io::Error::last_os_error());
                     }

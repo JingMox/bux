@@ -9,7 +9,7 @@ use std::process::Command;
 
 use bux_bwrap::{BwrapCommand, Namespace};
 
-use super::{JailConfig, Sandbox};
+use super::{JailConfig, Sandbox, SandboxCapabilities, SandboxKind};
 
 /// Bubblewrap (bwrap) sandbox for Linux.
 ///
@@ -46,5 +46,18 @@ impl Sandbox for BwrapSandbox {
         builder = builder.ro_bind(config_path, config_path);
 
         Some(builder.program(shim).arg(config_path).into_command())
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities {
+            namespaces: true,
+            seccomp: false,
+            mandatory_access_control: false,
+            cgroups: false,
+        }
+    }
+
+    fn kind(&self) -> SandboxKind {
+        SandboxKind::Bwrap
     }
 }
