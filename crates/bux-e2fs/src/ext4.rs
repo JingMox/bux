@@ -23,7 +23,7 @@
 
 use std::ffi::CString;
 use std::fs::OpenOptions;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::sys;
@@ -589,6 +589,16 @@ pub fn create_from_dir(source_dir: &Path, output: &Path, size_bytes: u64) -> Res
 /// Returns an error if the image cannot be opened or the write fails.
 pub fn inject_file(image: &Path, host_file: &Path, guest_path: &str) -> Result<()> {
     let mut fs = Filesystem::open(image)?;
+    if let Some(parent) = Path::new(guest_path).parent() {
+        let mut current_path = PathBuf::new();
+        for component in parent {
+            current_path.push(component);
+            match fs.mkdir(&current_path.to_string_lossy()) {
+                Ok(()) | Err(Error::Ext2fs { code: 2_133_571_344, .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
     fs.write_file(host_file, guest_path)
 }
 
