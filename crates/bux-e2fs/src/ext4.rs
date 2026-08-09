@@ -595,7 +595,11 @@ pub fn inject_file(image: &Path, host_file: &Path, guest_path: &str) -> Result<(
         for component in parent {
             current_path.push(component);
             match fs.mkdir(&current_path.to_string_lossy()) {
-                Ok(()) | Err(Error::Ext2fs { code: EXT2_ET_DIR_EXISTS, .. }) => {}
+                Ok(())
+                | Err(Error::Ext2fs {
+                    code: EXT2_ET_DIR_EXISTS,
+                    ..
+                }) => {}
                 Err(e) => return Err(e),
             }
         }
