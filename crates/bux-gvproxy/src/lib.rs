@@ -26,7 +26,7 @@
 //!     PathBuf::from("/tmp/my-vm/net.sock"),
 //!     vec![(8080, 80), (8443, 443)],
 //! );
-//! let instance = GvproxyInstance::new(config)?;
+//! let instance = GvproxyInstance::new(&config)?;
 //! let stats = instance.get_stats()?;
 //! eprintln!("bytes sent: {}", stats.bytes_sent);
 //! # Ok::<(), bux_gvproxy::Error>(())
