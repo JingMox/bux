@@ -608,11 +608,15 @@ pub fn create_from_dir(source_dir: &Path, output: &Path, size_bytes: u64) -> Res
 
 /// Inject a single host file into an existing ext4 image.
 ///
-/// Equivalent to `debugfs -w -R "write <host_file> <guest_path>"`.
+/// Missing parent directories of `guest_path` are created first, so this is
+/// closer to `mkdir -p $(dirname …) && debugfs -w -R "write …"` than to a bare
+/// `debugfs` write. Parents that already exist are left untouched, so repeated
+/// calls with different files under the same directory are safe.
 ///
 /// # Errors
 ///
-/// Returns an error if the image cannot be opened or the write fails.
+/// Returns an error if the image cannot be opened, a parent directory cannot be
+/// created, or the write fails.
 pub fn inject_file(image: &Path, host_file: &Path, guest_path: &str) -> Result<()> {
     let mut fs = Filesystem::open(image)?;
     if let Some(parent) = Path::new(guest_path).parent()
