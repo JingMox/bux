@@ -308,6 +308,32 @@ impl Filesystem {
         }
     }
 
+    /// Creates a directory and all missing intermediate directories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a directory cannot be created for a reason other
+    /// than it already existing.
+    pub fn mkdir_p(&mut self, name: &str) -> Result<()> {
+        const EXT2_ET_DIR_EXISTS: i64 = 2_133_571_328 + 79;
+        let mut prefix = String::new();
+        for component in name.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            match self.mkdir(&prefix) {
+                Ok(()) => {}
+                Err(Error::Ext2fs { code, .. }) if code == EXT2_ET_DIR_EXISTS => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Creates a symlink inside the filesystem image.
     ///
     /// # Errors
@@ -582,13 +608,22 @@ pub fn create_from_dir(source_dir: &Path, output: &Path, size_bytes: u64) -> Res
 
 /// Inject a single host file into an existing ext4 image.
 ///
-/// Equivalent to `debugfs -w -R "write <host_file> <guest_path>"`.
+/// Missing parent directories of `guest_path` are created first, so this is
+/// closer to `mkdir -p $(dirname …) && debugfs -w -R "write …"` than to a bare
+/// `debugfs` write. Parents that already exist are left untouched, so repeated
+/// calls with different files under the same directory are safe.
 ///
 /// # Errors
 ///
-/// Returns an error if the image cannot be opened or the write fails.
+/// Returns an error if the image cannot be opened, a parent directory cannot be
+/// created, or the write fails.
 pub fn inject_file(image: &Path, host_file: &Path, guest_path: &str) -> Result<()> {
     let mut fs = Filesystem::open(image)?;
+    if let Some(parent) = Path::new(guest_path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs.mkdir_p(&parent.to_string_lossy())?;
+    }
     fs.write_file(host_file, guest_path)
 }
 
