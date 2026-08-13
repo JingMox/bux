@@ -25,7 +25,7 @@ use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::path::Path;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Ext2Code, Result};
 use crate::sys;
 
 /// Block size for an ext4 filesystem.
@@ -315,7 +315,6 @@ impl Filesystem {
     /// Returns an error if a directory cannot be created for a reason other
     /// than it already existing.
     pub fn mkdir_p(&mut self, name: &str) -> Result<()> {
-        const EXT2_ET_DIR_EXISTS: i64 = 2_133_571_328 + 79;
         let mut prefix = String::new();
         for component in name.split('/') {
             if component.is_empty() {
@@ -326,8 +325,11 @@ impl Filesystem {
             }
             prefix.push_str(component);
             match self.mkdir(&prefix) {
-                Ok(()) => {}
-                Err(Error::Ext2fs { code, .. }) if code == EXT2_ET_DIR_EXISTS => {}
+                Ok(())
+                | Err(Error::Ext2fs {
+                    code: Ext2Code::DirExists,
+                    ..
+                }) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -664,7 +666,10 @@ const fn check(op: &'static str, code: sys::errcode_t) -> Result<()> {
     if code == 0 {
         Ok(())
     } else {
-        Err(Error::Ext2fs { op, code })
+        Err(Error::Ext2fs {
+            op,
+            code: Ext2Code::from_raw(code),
+        })
     }
 }
 
