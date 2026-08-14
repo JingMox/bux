@@ -209,9 +209,16 @@ impl Filesystem {
 
     /// Opens an existing ext4 image for read-write operations.
     ///
+    /// The allocation bitmaps are loaded from disk, so the returned handle
+    /// supports allocation ([`mkdir`](Self::mkdir),
+    /// [`write_file`](Self::write_file), [`alloc_inode`](Self::alloc_inode))
+    /// as well as reads, and modifications are written back when the
+    /// filesystem is closed.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the image does not exist or libext2fs fails to open it.
+    /// Returns an error if the image does not exist, libext2fs fails to open
+    /// it, or the allocation bitmaps cannot be read.
     pub fn open(path: &Path) -> Result<Self> {
         let c_path = to_cstring(path)?;
 
@@ -228,7 +235,13 @@ impl Filesystem {
                     std::ptr::from_mut(&mut fs),
                 ),
             )?;
-            Ok(Self { inner: fs })
+
+            // Wrap immediately — Drop guarantees ext2fs_close if the bitmap
+            // read below fails. libext2fs frees and NULLs any partially read
+            // map on error, so no manual bitmap cleanup is needed here.
+            let this = Self { inner: fs };
+            check("ext2fs_read_bitmaps", sys::ext2fs_read_bitmaps(this.inner))?;
+            Ok(this)
         }
     }
 
@@ -448,7 +461,8 @@ impl Filesystem {
     /// Allocates a new inode number near `dir` with the given POSIX `mode`.
     ///
     /// Updates the inode bitmap and allocation statistics automatically.
-    /// Requires bitmaps to be loaded (always true after [`create`](Self::create)).
+    /// Requires bitmaps to be loaded — guaranteed by both
+    /// [`create`](Self::create) and [`open`](Self::open).
     ///
     /// # Errors
     ///
@@ -470,7 +484,8 @@ impl Filesystem {
     /// Allocates a new block near `goal`.
     ///
     /// Updates the block bitmap and allocation statistics automatically.
-    /// Requires bitmaps to be loaded (always true after [`create`](Self::create)).
+    /// Requires bitmaps to be loaded — guaranteed by both
+    /// [`create`](Self::create) and [`open`](Self::open).
     ///
     /// # Errors
     ///
@@ -709,6 +724,12 @@ fn walk(dir: &Path, f: &mut impl FnMut(&std::fs::Metadata)) -> Result<()> {
 mod tests {
     use super::*;
 
+    // libext2fs's mount check calls libc `getmntinfo()`, which is not
+    // thread-safe on macOS, so tests that build images must run serially.
+    // If production ever builds base images concurrently, move this into
+    // `Filesystem::add_journal`.
+    static FS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn block_size_bytes_match_log_levels() {
         assert_eq!(BlockSize::B1024.bytes(), 1024);
@@ -747,5 +768,138 @@ mod tests {
     fn builder_journal_defaults_to_true() {
         let b = Ext4Builder::new();
         assert!(b.journal, "default should produce ext4 (with journal)");
+    }
+
+    // ---- reopening an image must load its allocation bitmaps ----
+
+    /// Builds a 64 MiB image from an empty rootfs plus a payload file. The
+    /// `TempDir` must be kept alive by the caller or the files are deleted.
+    fn image_fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+
+        let image = dir.path().join("image.raw");
+        create_from_dir(&rootfs, &image, 64 * 1024 * 1024).unwrap();
+
+        let payload = dir.path().join("payload.bin");
+        std::fs::write(&payload, b"bux-guest").unwrap();
+
+        (dir, image, payload)
+    }
+
+    #[test]
+    fn reopened_image_supports_allocation() {
+        let _guard = FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::TempDir::new().unwrap();
+        let image = dir.path().join("image.raw");
+
+        // Session 1: create an image with a journal, then close it.
+        {
+            let mut fs =
+                Filesystem::create(&image, 64 * 1024 * 1024, &CreateOptions::default()).unwrap();
+            fs.add_journal().unwrap();
+        }
+
+        // Session 2: reopen and allocate. A missing bitmap load makes every
+        // call here fail with EXT2_ET_NO_INODE_BITMAP.
+        {
+            let mut fs = Filesystem::open(&image).unwrap();
+            fs.mkdir_p("bux/bin").unwrap();
+            let ino = fs.alloc_inode(sys::EXT2_ROOT_INO, 0o100_644).unwrap();
+            assert!(
+                ino >= 11,
+                "allocated inode {ino} should be past the reserved range"
+            );
+        }
+
+        // Session 3: reopen once more. The directory must survive the
+        // round-trip, and a fresh allocation must skip inodes 11-13 that
+        // session 2 took — both hold only if the dirty bitmaps were written
+        // back on close; a stale bitmap would hand out inode 11 again.
+        {
+            let mut fs = Filesystem::open(&image).unwrap();
+            let err = fs.mkdir("bux").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::Ext2fs {
+                        code: Ext2Code::DirExists,
+                        ..
+                    }
+                ),
+                "second mkdir should report DirExists, got {err:?}"
+            );
+            let ino = fs.alloc_inode(sys::EXT2_ROOT_INO, 0o100_644).unwrap();
+            assert!(
+                ino >= 14,
+                "dirty bitmaps were not written back: reused inode {ino} from session 2"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_file_creates_missing_parent_directories() {
+        let _guard = FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_dir, image, payload) = image_fixture();
+
+        // None of a/, a/b/ or a/b/c/ exist in a freshly built image.
+        inject_file(&image, &payload, "a/b/c/data.bin").unwrap();
+
+        let mut fs = Filesystem::open(&image).unwrap();
+        for existing in ["a", "a/b", "a/b/c"] {
+            let err = fs.mkdir(existing).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::Ext2fs {
+                        code: Ext2Code::DirExists,
+                        ..
+                    }
+                ),
+                "directory {existing} should exist, got {err:?}"
+            );
+        }
+
+        let err = fs.write_file(&payload, "a/b/c/data.bin").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Ext2fs {
+                    code: Ext2Code::FileExists,
+                    ..
+                }
+            ),
+            "injected file should already exist, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inject_file_is_idempotent_when_parents_exist() {
+        let _guard = FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_dir, image, payload) = image_fixture();
+
+        inject_file(&image, &payload, "a/b/c/first.bin").unwrap();
+        // a/, a/b/ and a/b/c/ now exist — mkdir_p must swallow DirExists
+        // instead of propagating it.
+        inject_file(&image, &payload, "a/b/c/second.bin").unwrap();
+    }
+
+    #[test]
+    fn inject_file_without_parent_directory_works() {
+        let _guard = FS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_dir, image, payload) = image_fixture();
+
+        // No '/' in the guest path — the mkdir_p branch must be skipped.
+        inject_file(&image, &payload, "toplevel.bin").unwrap();
     }
 }
