@@ -54,7 +54,7 @@ pub mod sys;
 mod error;
 mod ext4;
 
-pub use error::{Error, Result};
+pub use error::{Error, Ext2Code, Result};
 pub use ext4::{
     BlockSize, CreateOptions, Ext4Builder, FileType, Filesystem, create_from_dir,
     estimate_image_size, inject_file,
