@@ -25,6 +25,9 @@ flate2.workspace = true
 tar.workspace = true
 ureq.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
 

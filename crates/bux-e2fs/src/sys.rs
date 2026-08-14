@@ -48,6 +48,21 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 #[cfg(not(feature = "regenerate"))]
 include!("bindings.rs");
 
+// Hand-written declarations for symbols that exist in libext2fs.a but are
+// deliberately kept out of the bindgen allowlist in build.rs. Adding them to
+// that list would produce duplicate definitions (E0428) in this module when
+// the `regenerate` feature is enabled.
 unsafe extern "C" {
+    /// Recommended journal size in blocks for a filesystem of `num_blocks`;
+    /// returns a negative value on failure.
     pub fn ext2fs_default_journal_size(num_blocks: __u64) -> ::core::ffi::c_int;
+
+    /// Loads the on-disk inode and block bitmaps into `fs->inode_map` and
+    /// `fs->block_map`.
+    ///
+    /// `ext2fs_open` leaves both maps NULL, so allocations
+    /// (`ext2fs_new_inode`, `ext2fs_new_block2`) fail until this runs.
+    /// Idempotent — maps already loaded are left alone — and it installs the
+    /// `write_bitmaps` callback so `ext2fs_close` flushes them to disk.
+    pub fn ext2fs_read_bitmaps(fs: ext2_filsys) -> errcode_t;
 }

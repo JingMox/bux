@@ -124,6 +124,10 @@ fn generate_bindings(headers_dir: &Path, out_dir: &Path) {
         .allowlist_function("ext2fs_allocate_tables")
         .allowlist_function("ext2fs_add_journal_inode")
         .allowlist_function("ext2fs_mark_super_dirty")
+        // NOTE: `ext2fs_read_bitmaps` and `ext2fs_default_journal_size` are
+        // intentionally absent from this list — they are hand-declared in
+        // src/sys.rs so they work without the `regenerate` feature. Adding
+        // them here would collide with those declarations (E0428).
         // Inode operations
         .allowlist_function("ext2fs_mkdir")
         .allowlist_function("ext2fs_link")
