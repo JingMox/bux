@@ -76,7 +76,8 @@ pub(crate) async fn put_file(
         (status = 200, description = "File bytes", content_type = "application/octet-stream", body = Vec<u8>),
         (status = 400, description = "Invalid path"),
         (status = 401, description = "Missing or invalid Bearer token"),
-        (status = 404, description = "Missing or other tenant")
+        (status = 404, description = "Missing or other tenant"),
+        (status = 413, description = "File over 32 MiB")
     )
 )]
 pub(crate) async fn get_file(
@@ -88,13 +89,10 @@ pub(crate) async fn get_file(
     validate_guest_path(&query.path)?;
     let vm = load_owned(&state.runtime, &tenant.id, &id)?;
     let data = vm
-        .read_file(&query.path)
+        .read_file(&query.path, MAX_FILE_BODY_BYTES as u64)
         .await
         .map_err(ApiError::from_engine)?;
     vm.touch_activity().map_err(ApiError::from_engine)?;
-    if data.len() > MAX_FILE_BODY_BYTES {
-        return Err(ApiError::payload_too_large());
-    }
     Ok(data)
 }
 
@@ -345,9 +343,12 @@ mod tests {
             .and_then(|rest| rest.split("\nasync fn ").next())
             .expect("get_file");
         assert!(
-            get_fn.contains("MAX_FILE_BODY_BYTES"),
-            "GET must cap at the files body limit"
+            get_fn.contains("read_file(&query.path, MAX_FILE_BODY_BYTES as u64)"),
+            "GET must pass the files body limit into recv"
         );
-        assert!(get_fn.contains("payload_too_large"), "oversized GET is 413");
+        assert!(
+            !get_fn.contains("data.len() > MAX_FILE_BODY_BYTES"),
+            "post-check after a full buffer is the OOM"
+        );
     }
 }

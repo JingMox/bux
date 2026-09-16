@@ -264,6 +264,9 @@ impl ApiError {
                 existing_id: None,
                 field: None,
             },
+            bux::Error::Io(ref e) if e.kind() == io::ErrorKind::FileTooLarge => {
+                Self::payload_too_large_msg(e.to_string())
+            }
             other => Self::internal(other.to_string()),
         }
     }
@@ -373,5 +376,46 @@ impl IntoResponse for ApiError {
             },
         };
         (self.status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_engine_file_too_large_is_413() {
+        let err = ApiError::from_engine(bux::Error::Io(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "download exceeds 1 byte limit",
+        )));
+        assert_eq!(err.status, StatusCode::PAYLOAD_TOO_LARGE, "status");
+        assert_eq!(err.code, "payload_too_large", "code");
+        assert!(
+            err.message.contains("download exceeds"),
+            "message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn production_maps_file_too_large() {
+        let prod = include_str!("error.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("prod");
+        let from_engine = prod
+            .split("fn from_engine(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("from_engine");
+        assert!(
+            from_engine.contains("FileTooLarge"),
+            "GET oversize is FileTooLarge"
+        );
+        assert!(
+            from_engine.contains("payload_too_large_msg"),
+            "413 message from codec, not request-body text"
+        );
     }
 }

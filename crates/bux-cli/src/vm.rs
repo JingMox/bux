@@ -489,7 +489,9 @@ pub async fn cp(args: CpArgs) -> Result<()> {
         // guest → host
         (Some((id, guest_path)), None) => {
             let handle = rt.get(id)?;
-            let tar_data = handle.copy_out(guest_path).await?;
+            let tar_data = handle
+                .copy_out(guest_path, bux_proto::MAX_DOWNLOAD_BYTES)
+                .await?;
             std::fs::create_dir_all(dst)?;
             // unpack → Entry::unpack_in skips ParentDir (workspace tar 0.4.46).
             unpack_guest_tar(&tar_data, std::path::Path::new(dst))?;

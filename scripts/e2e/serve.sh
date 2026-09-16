@@ -305,6 +305,11 @@ http GET "/v1/sandboxes/${LOOP_ID}/files?path=/workspace/x" "${KEY1_SEC}"
 require_http 200 "GET /workspace/x"
 grep -qx persist-ok "${RESP}"
 
+echo "==> GET /dev/zero 413"
+HTTP_TIMEOUT=30 http GET "/v1/sandboxes/${LOOP_ID}/files?path=/dev/zero" "${KEY1_SEC}"
+require_http 413 "GET /dev/zero"
+test "$(json_get "${RESP}" error.code)" = "payload_too_large"
+
 echo "==> second tenant 404"
 http GET "/v1/sandboxes/${LOOP_ID}" "${KEY2_SEC}"
 require_http 404 "other tenant GET sandbox"

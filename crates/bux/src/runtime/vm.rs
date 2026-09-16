@@ -789,9 +789,10 @@ impl Vm {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read.
-    pub async fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-        Ok(self.client.read_file(path).await?)
+    /// Returns an error if the file cannot be read or the download exceeds
+    /// `max_bytes`.
+    pub async fn read_file(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        Ok(self.client.read_file(path, max_bytes).await?)
     }
 
     /// Writes a file to the guest filesystem.
@@ -835,9 +836,10 @@ impl Vm {
     ///
     /// # Errors
     ///
-    /// Returns an error if the copy operation fails.
-    pub async fn copy_out(&self, path: &str) -> Result<Vec<u8>> {
-        let data = self.client.copy_out(path).await?;
+    /// Returns an error if the copy operation fails or the archive exceeds
+    /// `max_bytes`.
+    pub async fn copy_out(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let data = self.client.copy_out(path, max_bytes).await?;
         self.emit_file_copied(CopyDirection::Out, path);
         Ok(data)
     }
@@ -846,16 +848,18 @@ impl Vm {
     ///
     /// # Errors
     ///
-    /// Returns an error if the streaming copy fails.
+    /// Returns an error if the streaming copy fails or the archive exceeds
+    /// `max_bytes`.
     pub async fn copy_out_to_writer(
         &self,
         path: &str,
         follow_symlinks: bool,
         writer: &mut (impl tokio::io::AsyncWrite + Unpin + Send),
+        max_bytes: u64,
     ) -> Result<u64> {
         let n = self
             .client
-            .copy_out_to_writer(path, follow_symlinks, writer)
+            .copy_out_to_writer(path, follow_symlinks, writer, max_bytes)
             .await?;
         self.emit_file_copied(CopyDirection::Out, path);
         Ok(n)

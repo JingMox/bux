@@ -434,7 +434,7 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the file cannot be read.
-    pub(crate) async fn read_file(&self, path: &str) -> io::Result<Vec<u8>> {
+    pub(crate) async fn read_file(&self, path: &str, max_bytes: u64) -> io::Result<Vec<u8>> {
         let mut stream = self.connect_raw().await?;
         bux_proto::send(
             &mut stream,
@@ -444,7 +444,7 @@ impl Client {
         )
         .await?;
         Self::expect_ready(&mut stream).await?;
-        bux_proto::recv_download(&mut stream).await
+        bux_proto::recv_download(&mut stream, max_bytes).await
     }
 
     /// Writes a file to the guest filesystem.
@@ -517,8 +517,8 @@ impl Client {
     /// # Errors
     ///
     /// Returns an error if the copy operation fails.
-    pub(crate) async fn copy_out(&self, path: &str) -> io::Result<Vec<u8>> {
-        self.copy_out_opts(path, false).await
+    pub(crate) async fn copy_out(&self, path: &str, max_bytes: u64) -> io::Result<Vec<u8>> {
+        self.copy_out_opts(path, false, max_bytes).await
     }
 
     /// Copies a path from the guest as a tar archive with options.
@@ -530,6 +530,7 @@ impl Client {
         &self,
         path: &str,
         follow_symlinks: bool,
+        max_bytes: u64,
     ) -> io::Result<Vec<u8>> {
         let mut stream = self.connect_raw().await?;
         bux_proto::send(
@@ -541,7 +542,7 @@ impl Client {
         )
         .await?;
         Self::expect_ready(&mut stream).await?;
-        bux_proto::recv_download(&mut stream).await
+        bux_proto::recv_download(&mut stream, max_bytes).await
     }
 
     /// Streams a path from the guest as a tar archive directly to `writer`.
@@ -557,6 +558,7 @@ impl Client {
         path: &str,
         follow_symlinks: bool,
         writer: &mut (impl AsyncWrite + Unpin + Send),
+        max_bytes: u64,
     ) -> io::Result<u64> {
         let mut stream = self.connect_raw().await?;
         bux_proto::send(
@@ -568,7 +570,7 @@ impl Client {
         )
         .await?;
         Self::expect_ready(&mut stream).await?;
-        bux_proto::recv_download_to_writer(&mut stream, writer).await
+        bux_proto::recv_download_to_writer(&mut stream, writer, max_bytes).await
     }
 
     /// Opens a raw Unix socket connection to the guest agent.

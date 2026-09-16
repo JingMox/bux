@@ -123,18 +123,42 @@ pub async fn send_download(
     send(w, &Download::Done).await
 }
 
+/// Returns `total + chunk` if that stays within `max_bytes`.
+///
+/// Checked before the caller extends or writes so the collect buffer cannot
+/// grow past the cap.
+fn account_download_chunk(total: u64, chunk_len: usize, max_bytes: u64) -> io::Result<u64> {
+    let add = u64::try_from(chunk_len).unwrap_or(u64::MAX);
+    let next = total.saturating_add(add);
+    if next > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("download exceeds {max_bytes} byte limit"),
+        ));
+    }
+    Ok(next)
+}
+
 /// Receives a download stream ([`Download::Chunk`] + [`Download::Done`]),
-/// collecting all chunks into a single buffer.
+/// collecting all chunks into a single buffer with a size limit.
 ///
 /// # Errors
 ///
-/// Returns an error if a read/deserialize fails or the remote sends an error.
-pub async fn recv_download(r: &mut (impl AsyncRead + Unpin + Send)) -> io::Result<Vec<u8>> {
+/// Returns an error if a read/deserialize fails, the remote sends an error,
+/// or the download exceeds `max_bytes`.
+pub async fn recv_download(
+    r: &mut (impl AsyncRead + Unpin + Send),
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
     use crate::Download;
     let mut buf = Vec::new();
+    let mut total: u64 = 0;
     loop {
         match recv::<Download>(r).await? {
-            Download::Chunk(data) => buf.extend(data),
+            Download::Chunk(data) => {
+                total = account_download_chunk(total, data.len(), max_bytes)?;
+                buf.extend(data);
+            }
             Download::Done => return Ok(buf),
             Download::Error(e) => return Err(io::Error::other(e.message)),
         }
@@ -259,17 +283,19 @@ pub async fn recv_upload_to_writer(
 ///
 /// # Errors
 ///
-/// Returns an error if a read/write fails or the remote sends an error.
+/// Returns an error if a read/write fails, the remote sends an error, or the
+/// download exceeds `max_bytes`.
 pub async fn recv_download_to_writer(
     r: &mut (impl AsyncRead + Unpin + Send),
     dst: &mut (impl AsyncWrite + Unpin + Send),
+    max_bytes: u64,
 ) -> io::Result<u64> {
     use crate::Download;
     let mut total: u64 = 0;
     loop {
         match recv::<Download>(r).await? {
             Download::Chunk(data) => {
-                total += data.len() as u64;
+                total = account_download_chunk(total, data.len(), max_bytes)?;
                 dst.write_all(&data).await?;
             }
             Download::Done => {
@@ -292,8 +318,8 @@ pub async fn recv_download_to_writer(
 mod tests {
     use super::*;
     use crate::{
-        ControlReq, ControlResp, ErrorCode, ErrorInfo, ExecIn, ExecOut, ExecStart, Hello, HelloAck,
-        Upload, UploadResult,
+        ControlReq, ControlResp, Download, ErrorCode, ErrorInfo, ExecIn, ExecOut, ExecStart, Hello,
+        HelloAck, Upload, UploadResult,
     };
 
     #[tokio::test]
@@ -494,7 +520,7 @@ mod tests {
 
         send_download(&mut s, &data, 256).await.unwrap();
 
-        let received = recv_download(&mut c).await.unwrap();
+        let received = recv_download(&mut c, 1024).await.unwrap();
         assert_eq!(received, data);
     }
 
@@ -570,7 +596,50 @@ mod tests {
             .unwrap();
         assert_eq!(total, 500);
 
-        let received = recv_download(&mut c).await.unwrap();
+        let received = recv_download(&mut c, 1024).await.unwrap();
         assert_eq!(received, data);
+    }
+
+    #[tokio::test]
+    async fn recv_download_rejects_oversized() {
+        let (mut c, mut s) = tokio::io::duplex(4096);
+        send(&mut s, &Download::Chunk(vec![0u8; 200]))
+            .await
+            .unwrap();
+        send(&mut s, &Download::Done).await.unwrap();
+        let err = recv_download(&mut c, 100).await.expect_err("oversize");
+        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge, "kind");
+    }
+
+    #[tokio::test]
+    async fn recv_download_to_writer_rejects_oversized() {
+        let (mut c, mut s) = tokio::io::duplex(4096);
+        send(&mut s, &Download::Chunk(vec![0u8; 200]))
+            .await
+            .unwrap();
+        send(&mut s, &Download::Done).await.unwrap();
+        let mut dst = Vec::new();
+        let err = recv_download_to_writer(&mut c, &mut dst, 100)
+            .await
+            .expect_err("oversize");
+        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge, "kind");
+        assert!(dst.len() <= 100, "dst must not exceed max_bytes");
+    }
+
+    #[tokio::test]
+    async fn recv_download_accepts_exact_max() {
+        let (mut c, mut s) = tokio::io::duplex(4096);
+        let data = vec![7u8; 100];
+        send_download(&mut s, &data, 256).await.unwrap();
+        let received = recv_download(&mut c, 100).await.unwrap();
+        assert_eq!(received, data);
+    }
+
+    #[tokio::test]
+    async fn recv_download_empty_ok() {
+        let (mut c, mut s) = tokio::io::duplex(1024);
+        send(&mut s, &Download::Done).await.unwrap();
+        let received = recv_download(&mut c, 0).await.unwrap();
+        assert!(received.is_empty(), "empty Done is ok at max_bytes 0");
     }
 }
