@@ -226,6 +226,16 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn exec_collect_timeout() -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            code: "exec_timeout",
+            message: "guest did not report exec exit within timeout_ms".into(),
+            existing_id: None,
+            field: None,
+        }
+    }
+
     pub(crate) fn with_field(mut self, field: &'static str) -> Self {
         self.field = Some(field.into());
         self
@@ -416,6 +426,17 @@ mod tests {
         assert!(
             from_engine.contains("payload_too_large_msg"),
             "413 message from codec, not request-body text"
+        );
+    }
+
+    #[test]
+    fn exec_collect_timeout_is_504() {
+        let err = ApiError::exec_collect_timeout();
+        assert_eq!(err.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(err.code, "exec_timeout");
+        assert!(
+            err.message.contains("timeout_ms"),
+            "message names the guest clock"
         );
     }
 }
