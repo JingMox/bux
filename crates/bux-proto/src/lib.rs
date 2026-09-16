@@ -26,6 +26,6 @@ pub use codec::{
 };
 pub use message::{
     AGENT_PORT, ControlReq, ControlResp, Download, ErrorCode, ErrorInfo, ExecIn, ExecOut,
-    ExecStart, Hello, HelloAck, MAX_UPLOAD_BYTES, PROTOCOL_VERSION, STREAM_CHUNK_SIZE, TtyConfig,
-    Upload, UploadResult,
+    ExecStart, Hello, HelloAck, MAX_DOWNLOAD_BYTES, MAX_UPLOAD_BYTES, PROTOCOL_VERSION,
+    STREAM_CHUNK_SIZE, TtyConfig, Upload, UploadResult,
 };

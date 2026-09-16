@@ -27,6 +27,9 @@ pub const STREAM_CHUNK_SIZE: usize = 1 << 20;
 /// Maximum total upload size accepted by the guest agent (512 MiB).
 pub const MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Maximum total download size accepted by host collect paths (512 MiB).
+pub const MAX_DOWNLOAD_BYTES: u64 = MAX_UPLOAD_BYTES;
+
 /// Default vsock port for the bux guest agent.
 pub const AGENT_PORT: u32 = 1024;
 
@@ -423,6 +426,12 @@ mod tests {
     #[test]
     fn protocol_version_is_10() {
         assert_eq!(PROTOCOL_VERSION, 10);
+    }
+
+    #[test]
+    fn max_download_bytes_matches_upload() {
+        assert_eq!(MAX_DOWNLOAD_BYTES, MAX_UPLOAD_BYTES);
+        assert_eq!(MAX_DOWNLOAD_BYTES, 512 * 1024 * 1024);
     }
 
     #[test]

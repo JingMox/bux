@@ -2,6 +2,7 @@
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -139,10 +140,20 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Json<Metric
 }
 
 async fn map_payload_too_large(response: Response) -> Response {
-    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        ApiError::payload_too_large().into_response()
-    } else {
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return response;
+    }
+    // Handler JSON 413 (GET oversize, pull cap) already has the envelope.
+    // tower/axum request-body 413 does not.
+    let already_json = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if already_json {
         response
+    } else {
+        ApiError::payload_too_large().into_response()
     }
 }
 
@@ -399,6 +410,41 @@ mod tests {
             Some("payload_too_large"),
             "code"
         );
+        assert_eq!(
+            v.pointer("/error/message")
+                .and_then(serde_json::Value::as_str),
+            Some("request body too large"),
+            "tower 413 rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_413_keeps_codec_message() {
+        async fn oversize() -> Result<Vec<u8>, ApiError> {
+            Err(ApiError::payload_too_large_msg(
+                "download exceeds 1 byte limit",
+            ))
+        }
+        let app = Router::new()
+            .route("/t", get(oversize))
+            .layer(middleware::map_response(map_payload_too_large));
+        let res = app
+            .oneshot(Request::builder().uri("/t").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE, "status");
+        let v = json_body(res).await;
+        assert_eq!(
+            v.pointer("/error/code").and_then(serde_json::Value::as_str),
+            Some("payload_too_large"),
+            "code"
+        );
+        assert_eq!(
+            v.pointer("/error/message")
+                .and_then(serde_json::Value::as_str),
+            Some("download exceeds 1 byte limit"),
+            "handler 413 must not become request-body text"
+        );
     }
 
     #[test]
@@ -416,6 +462,15 @@ mod tests {
         assert!(prod.contains("/v1/metrics"), "metrics");
         assert!(prod.contains("snapshots::routes"), "snapshot routes");
         assert!(prod.contains("MAX_FILE_BODY_BYTES"), "files body limit");
+        assert!(prod.contains("map_payload_too_large"), "413 rewrite layer");
+        let map_fn = prod
+            .split("async fn map_payload_too_large(")
+            .nth(1)
+            .expect("map_payload_too_large");
+        assert!(
+            map_fn.contains("application/json"),
+            "do not rewrite handler JSON 413"
+        );
     }
 
     #[tokio::test]
