@@ -313,6 +313,21 @@ msg="$(json_get "${RESP}" error.message)"
 grep -q -- 'download exceeds' <<<"${msg}"
 test "${msg}" != "request body too large"
 
+echo "==> exec timeout kills process group"
+HTTP_TIMEOUT=5 post_json "/v1/sandboxes/${LOOP_ID}/exec" "${KEY1_SEC}" \
+  '{"cmd":"sh","args":["-c","sleep 8 &"],"timeout_ms":1000}'
+require_http 200 "exec timeout job-kill"
+python3 - "${RESP}" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    v = json.load(f)
+if v.get("timed_out") is not True:
+    raise SystemExit(f"timed_out {v.get('timed_out')!r} (want True)")
+d = int(v["duration_ms"])
+if d >= 3000:
+    raise SystemExit(f"duration_ms {d} >= 3000")
+PY
+
 echo "==> second tenant 404"
 http GET "/v1/sandboxes/${LOOP_ID}" "${KEY2_SEC}"
 require_http 404 "other tenant GET sandbox"

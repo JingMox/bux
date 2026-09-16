@@ -97,8 +97,8 @@ pub fn spawn(req: &ExecStart, reaper: &Reaper) -> io::Result<PtyHandle> {
         cmd.stderr(Stdio::from_raw_fd(slave_stderr.into_raw_fd()));
     }
 
-    // Single pre_exec: session + controlling TTY + optional credentials.
-    // (Command keeps only the last pre_exec hook.)
+    // pre_exec appends; one closure so setsid runs before TIOCSCTTY in the child.
+    // Making the child a group leader first makes setsid fail with EPERM.
     unsafe {
         cmd.pre_exec(move || {
             nix::unistd::setsid().map_err(io::Error::other)?;

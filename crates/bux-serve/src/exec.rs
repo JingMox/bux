@@ -16,6 +16,8 @@ use crate::state::AppState;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
+const HOST_COLLECT_SLACK_MS: u64 = 2_000;
+const HOST_SIGNAL_BOUND_MS: u64 = 100;
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new().route("/v1/sandboxes/{id}/exec", post(exec_one))
@@ -57,7 +59,8 @@ pub(crate) struct ExecResponse {
         (status = 400, description = "Invalid body or timeout_ms"),
         (status = 401, description = "Missing or invalid Bearer token"),
         (status = 404, description = "Missing or other tenant"),
-        (status = 409, description = "secrets_required")
+        (status = 409, description = "secrets_required"),
+        (status = 504, description = "Guest did not Exit within timeout_ms plus slack")
     )
 )]
 pub(crate) async fn exec_one(
@@ -85,7 +88,7 @@ pub(crate) async fn exec_one(
 
     let handle = vm.exec(start).await.map_err(ApiError::from_engine)?;
     let cap = usize::try_from(state.limits.max_exec_output_bytes).unwrap_or(usize::MAX);
-    Ok(Json(collect_capped(handle, cap).await?))
+    Ok(Json(collect_capped(handle, cap, timeout_ms).await?))
 }
 
 fn parse_timeout_ms(timeout_ms: Option<u64>) -> Result<u64, ApiError> {
@@ -99,31 +102,50 @@ fn parse_timeout_ms(timeout_ms: Option<u64>) -> Result<u64, ApiError> {
     Ok(timeout_ms)
 }
 
-async fn collect_capped(mut handle: ExecHandle, cap: usize) -> Result<ExecResponse, ApiError> {
+async fn collect_capped(
+    mut handle: ExecHandle,
+    cap: usize,
+    timeout_ms: u64,
+) -> Result<ExecResponse, ApiError> {
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(timeout_ms.saturating_add(HOST_COLLECT_SLACK_MS));
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut truncated = false;
     let mut signaled = false;
     loop {
-        match handle.next_output().await {
-            Ok(ExecOut::Stdout(chunk)) => {
+        match tokio::time::timeout_at(deadline, handle.next_output()).await {
+            Err(_elapsed) => {
+                // Unbounded signal() is write_all+flush and re-hangs 504 on a stuck vsock.
+                // After timeout_at cancels next_output, recv may have a partial length
+                // prefix; do not call next_output again.
+                drop(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(HOST_SIGNAL_BOUND_MS),
+                        handle.signal(9),
+                    )
+                    .await,
+                );
+                return Err(ApiError::exec_collect_timeout());
+            }
+            Ok(Ok(ExecOut::Stdout(chunk))) => {
                 if !append_capped(&mut stdout, &chunk, cap) {
                     truncated = true;
                     kill_once(&mut handle, &mut signaled).await;
                 }
             }
-            Ok(ExecOut::Stderr(chunk)) => {
+            Ok(Ok(ExecOut::Stderr(chunk))) => {
                 if !append_capped(&mut stderr, &chunk, cap) {
                     truncated = true;
                     kill_once(&mut handle, &mut signaled).await;
                 }
             }
-            Ok(ExecOut::Exit {
+            Ok(Ok(ExecOut::Exit {
                 code,
                 timed_out,
                 duration_ms,
                 ..
-            }) => {
+            })) => {
                 return Ok(ExecResponse {
                     stdout: String::from_utf8_lossy(&stdout).into_owned(),
                     stderr: String::from_utf8_lossy(&stderr).into_owned(),
@@ -133,13 +155,13 @@ async fn collect_capped(mut handle: ExecHandle, cap: usize) -> Result<ExecRespon
                     truncated,
                 });
             }
-            Ok(ExecOut::Error(info)) => {
+            Ok(Ok(ExecOut::Error(info))) => {
                 return Err(ApiError::from_engine(bux::Error::Io(
                     std::io::Error::other(info.message),
                 )));
             }
-            Err(err) => return Err(ApiError::from_engine(err.into())),
-            Ok(_) => {}
+            Ok(Err(err)) => return Err(ApiError::from_engine(err.into())),
+            Ok(Ok(_)) => {}
         }
     }
 }
@@ -501,6 +523,21 @@ mod tests {
     }
 
     #[test]
+    fn collect_slack_does_not_overflow() {
+        assert_eq!(HOST_COLLECT_SLACK_MS, 2_000, "2s slack");
+        assert_eq!(
+            1000u64.saturating_add(HOST_COLLECT_SLACK_MS),
+            3000,
+            "1000 + 2000"
+        );
+        assert_eq!(
+            u64::MAX.saturating_add(HOST_COLLECT_SLACK_MS),
+            u64::MAX,
+            "saturating_add"
+        );
+    }
+
+    #[test]
     fn production_sets_guest_timeout_and_collects() {
         let prod = include_str!("exec.rs")
             .split("#[cfg(test)]")
@@ -512,19 +549,34 @@ mod tests {
         );
         assert!(prod.contains("next_output"), "collect via next_output");
         assert!(prod.contains("signal(9)"), "cap sends SIGKILL");
-        assert!(
-            !prod.contains("tokio::time::timeout"),
-            "must not wrap the host future"
-        );
-        assert!(
-            !prod.contains("time::timeout"),
-            "must not wrap the host future via time::timeout"
-        );
-        assert!(
-            !prod.contains("tokio::time"),
-            "exec must not import tokio::time"
-        );
         assert!(!prod.contains("/exec/{"), "no exec_id routes");
         assert!(prod.contains("ExecStart::new"), "build ExecStart");
+        assert!(prod.contains("timeout_at"), "host collect deadline");
+        assert!(
+            prod.contains("HOST_COLLECT_SLACK_MS"),
+            "collect slack constant"
+        );
+        assert!(prod.contains("HOST_SIGNAL_BOUND_MS"), "bounded last signal");
+        let collect_fn = prod
+            .split("async fn collect_capped(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nasync fn ").next())
+            .expect("collect_capped");
+        assert!(
+            collect_fn.contains("exec_collect_timeout"),
+            "elapsed arm must return exec_collect_timeout"
+        );
+        assert!(
+            collect_fn.contains("timeout_at"),
+            "collect_capped waits with timeout_at"
+        );
+        assert!(
+            collect_fn.contains("saturating_add(HOST_COLLECT_SLACK_MS)"),
+            "deadline is timeout_ms + slack, no overflow"
+        );
+        assert!(
+            !collect_fn.contains("timed_out: true"),
+            "elapsed arm must not fake HTTP 200 timed_out"
+        );
     }
 }
