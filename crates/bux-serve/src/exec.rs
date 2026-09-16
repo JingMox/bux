@@ -102,16 +102,13 @@ fn parse_timeout_ms(timeout_ms: Option<u64>) -> Result<u64, ApiError> {
     Ok(timeout_ms)
 }
 
-const fn collect_deadline(timeout_ms: u64) -> std::time::Duration {
-    std::time::Duration::from_millis(timeout_ms.saturating_add(HOST_COLLECT_SLACK_MS))
-}
-
 async fn collect_capped(
     mut handle: ExecHandle,
     cap: usize,
     timeout_ms: u64,
 ) -> Result<ExecResponse, ApiError> {
-    let deadline = tokio::time::Instant::now() + collect_deadline(timeout_ms);
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(timeout_ms.saturating_add(HOST_COLLECT_SLACK_MS));
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut truncated = false;
@@ -526,15 +523,16 @@ mod tests {
     }
 
     #[test]
-    fn collect_deadline_adds_slack_without_overflow() {
+    fn collect_slack_does_not_overflow() {
+        assert_eq!(HOST_COLLECT_SLACK_MS, 2_000, "2s slack");
         assert_eq!(
-            collect_deadline(1000),
-            Duration::from_secs(3),
-            "1000 + 2000 slack"
+            1000u64.saturating_add(HOST_COLLECT_SLACK_MS),
+            3000,
+            "1000 + 2000"
         );
         assert_eq!(
-            collect_deadline(u64::MAX),
-            Duration::from_millis(u64::MAX),
+            u64::MAX.saturating_add(HOST_COLLECT_SLACK_MS),
+            u64::MAX,
             "saturating_add"
         );
     }
@@ -571,6 +569,10 @@ mod tests {
         assert!(
             collect_fn.contains("timeout_at"),
             "collect_capped waits with timeout_at"
+        );
+        assert!(
+            collect_fn.contains("saturating_add(HOST_COLLECT_SLACK_MS)"),
+            "deadline is timeout_ms + slack, no overflow"
         );
         assert!(
             !collect_fn.contains("timed_out: true"),

@@ -102,8 +102,6 @@ async fn handle_pipe(
     w.flush().await?;
 
     let timed_out = Arc::new(AtomicBool::new(false));
-    let killer = spawn_timeout_killer(pid, req.timeout_ms, &timed_out);
-
     let mut child_stdin = spawned.child.stdin.take().map(file_from_stdio);
     // SAFETY: stdout/stderr were set to Stdio::piped() above.
     let Some(mut stdout) = spawned.child.stdout.take().map(file_from_stdio) else {
@@ -118,55 +116,57 @@ async fn handle_pipe(
     let mut stdout_buf = [0u8; 4096];
     let mut stderr_buf = [0u8; 4096];
 
-    loop {
-        // Exit the I/O loop once both output streams are done.
-        if stdout_done && stderr_done {
-            break;
-        }
+    {
+        let _guard = KillerGuard {
+            pid,
+            killer: spawn_timeout_killer(pid, req.timeout_ms, &timed_out),
+        };
+        loop {
+            // Exit the I/O loop once both output streams are done.
+            if stdout_done && stderr_done {
+                break;
+            }
 
-        tokio::select! {
-            host_msg = bux_proto::recv::<ExecIn>(r) => {
-                match host_msg {
-                    Ok(ExecIn::Stdin(data)) => {
-                        if let Some(ref mut stdin) = child_stdin {
-                            let _ = stdin.write_all(&data).await;
+            tokio::select! {
+                host_msg = bux_proto::recv::<ExecIn>(r) => {
+                    match host_msg {
+                        Ok(ExecIn::Stdin(data)) => {
+                            if let Some(ref mut stdin) = child_stdin {
+                                let _ = stdin.write_all(&data).await;
+                            }
+                        }
+                        Ok(ExecIn::StdinClose) => {
+                            child_stdin = None;
+                        }
+                        Ok(ExecIn::Signal(sig)) => {
+                            kill_job(pid, sig);
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            // Host disconnected — kill the job and collect exit status.
+                            kill_job(pid, libc::SIGKILL);
+                            break;
                         }
                     }
-                    Ok(ExecIn::StdinClose) => {
-                        child_stdin = None;
-                    }
-                    Ok(ExecIn::Signal(sig)) => {
-                        kill_job(pid, sig);
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        // Host disconnected — kill the job and collect exit status.
-                        kill_job(pid, libc::SIGKILL);
-                        break;
+                }
+                n = stdout.read(&mut stdout_buf), if !stdout_done => {
+                    match n {
+                        Ok(0) | Err(_) => stdout_done = true,
+                        Ok(len) => {
+                            bux_proto::send(w, &ExecOut::Stdout(stdout_buf[..len].to_vec())).await?;
+                        }
                     }
                 }
-            }
-            n = stdout.read(&mut stdout_buf), if !stdout_done => {
-                match n {
-                    Ok(0) | Err(_) => stdout_done = true,
-                    Ok(len) => {
-                        bux_proto::send(w, &ExecOut::Stdout(stdout_buf[..len].to_vec())).await?;
-                    }
-                }
-            }
-            n = stderr.read(&mut stderr_buf), if !stderr_done => {
-                match n {
-                    Ok(0) | Err(_) => stderr_done = true,
-                    Ok(len) => {
-                        bux_proto::send(w, &ExecOut::Stderr(stderr_buf[..len].to_vec())).await?;
+                n = stderr.read(&mut stderr_buf), if !stderr_done => {
+                    match n {
+                        Ok(0) | Err(_) => stderr_done = true,
+                        Ok(len) => {
+                            bux_proto::send(w, &ExecOut::Stderr(stderr_buf[..len].to_vec())).await?;
+                        }
                     }
                 }
             }
         }
-    }
-
-    if let Some(h) = killer {
-        h.abort();
     }
     drop(child_stdin);
     send_exit(w, spawned.exit.await, spawn_t0, &timed_out).await
@@ -203,43 +203,43 @@ async fn handle_pty(
     w.flush().await?;
 
     let timed_out = Arc::new(AtomicBool::new(false));
-    let killer = spawn_timeout_killer(pid, req.timeout_ms, &timed_out);
-
     let mut pty_buf = [0u8; 4096];
 
-    loop {
-        tokio::select! {
-            host_msg = bux_proto::recv::<ExecIn>(r) => {
-                match host_msg {
-                    Ok(ExecIn::Stdin(data)) => {
-                        let _ = pty_handle.master_write.write_all(&data).await;
-                    }
-                    Ok(ExecIn::Signal(sig)) => {
-                        kill_job(pid, sig);
-                    }
-                    Ok(ExecIn::ResizeTty(config)) => {
-                        pty_handle.resize(&config);
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        kill_job(pid, libc::SIGKILL);
-                        break;
+    {
+        let _guard = KillerGuard {
+            pid,
+            killer: spawn_timeout_killer(pid, req.timeout_ms, &timed_out),
+        };
+        loop {
+            tokio::select! {
+                host_msg = bux_proto::recv::<ExecIn>(r) => {
+                    match host_msg {
+                        Ok(ExecIn::Stdin(data)) => {
+                            let _ = pty_handle.master_write.write_all(&data).await;
+                        }
+                        Ok(ExecIn::Signal(sig)) => {
+                            kill_job(pid, sig);
+                        }
+                        Ok(ExecIn::ResizeTty(config)) => {
+                            pty_handle.resize(&config);
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            kill_job(pid, libc::SIGKILL);
+                            break;
+                        }
                     }
                 }
-            }
-            n = pty_handle.master_read.read(&mut pty_buf) => {
-                match n {
-                    Ok(0) | Err(_) => break,
-                    Ok(len) => {
-                        bux_proto::send(w, &ExecOut::Stdout(pty_buf[..len].to_vec())).await?;
+                n = pty_handle.master_read.read(&mut pty_buf) => {
+                    match n {
+                        Ok(0) | Err(_) => break,
+                        Ok(len) => {
+                            bux_proto::send(w, &ExecOut::Stdout(pty_buf[..len].to_vec())).await?;
+                        }
                     }
                 }
             }
         }
-    }
-
-    if let Some(h) = killer {
-        h.abort();
     }
     send_exit(w, pty_handle.exit.await, spawn_t0, &timed_out).await
 }
@@ -255,7 +255,24 @@ fn kill_job(pgid: i32, sig: i32) {
     }
 }
 
-/// After `timeout_ms`, `kill_job` the process group. Abort the handle when the I/O loop ends.
+/// JoinHandle drop detaches; abort and SIGKILL must run on send/`?` too.
+struct KillerGuard {
+    /// Process group to SIGKILL on drop (send/`?` would otherwise leak it).
+    pid: i32,
+    /// Timeout task; abort on drop because JoinHandle drop detaches.
+    killer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for KillerGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.killer.take() {
+            h.abort();
+        }
+        kill_job(self.pid, libc::SIGKILL);
+    }
+}
+
+/// After `timeout_ms`, `kill_job` the process group. `KillerGuard` aborts this task.
 fn spawn_timeout_killer(
     pid: i32,
     timeout_ms: u64,
@@ -431,7 +448,22 @@ mod tests {
         assert!(prod.contains("setpgid"), "parent setpgid");
         assert!(prod.contains("fn kill_job"), "kill_job exists");
         assert!(prod.contains("apply_exec_options"), "macro kept");
+        assert!(
+            prod.contains("impl Drop for KillerGuard"),
+            "JoinHandle drop detaches"
+        );
         assert!(prod.contains(".abort()"), "abort killer");
+
+        let drop_impl = fn_body(
+            prod,
+            "impl Drop for KillerGuard",
+            "\nfn spawn_timeout_killer(",
+        );
+        assert!(drop_impl.contains(".abort()"), "Drop aborts the killer");
+        assert!(
+            drop_impl.contains("kill_job(self.pid"),
+            "Drop SIGKILLs the job so send/? does not leak it"
+        );
 
         let pipe = fn_body(prod, "async fn handle_pipe(", "\nasync fn handle_pty(");
         assert!(
@@ -448,7 +480,13 @@ mod tests {
             2,
             "pipe signal + disconnect use kill_job"
         );
-        assert!(pipe.contains(".abort()"), "pipe aborts killer");
+        assert!(
+            pipe.split("loop {")
+                .next()
+                .expect("pipe loop")
+                .contains("KillerGuard"),
+            "pipe guard must wrap the I/O loop"
+        );
         assert!(
             !pipe.contains("libc::kill("),
             "pipe must not kill pid directly"
@@ -460,7 +498,13 @@ mod tests {
             2,
             "pty signal + disconnect use kill_job"
         );
-        assert!(pty.contains(".abort()"), "pty aborts killer");
+        assert!(
+            pty.split("loop {")
+                .next()
+                .expect("pty loop")
+                .contains("KillerGuard"),
+            "pty guard must wrap the I/O loop"
+        );
         assert!(
             !pty.contains("libc::kill("),
             "pty must not kill pid directly"
