@@ -55,10 +55,7 @@ pub fn create_overlay(
     let backing_bytes = backing_file.as_bytes();
     let fmt_bytes = backing_format.as_str().as_bytes();
 
-    let header_ext_len = (HEADER_LENGTH as usize)
-        + 8
-        + align8(fmt_bytes.len())
-        + 8;
+    let header_ext_len = (HEADER_LENGTH as usize) + 8 + align8(fmt_bytes.len()) + 8;
     let max_backing_len = (CLUSTER_SIZE as usize).saturating_sub(header_ext_len);
     if backing_bytes.len() > max_backing_len {
         return Err(Error::BackingPathTooLong {
