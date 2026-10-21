@@ -29,5 +29,4 @@ Optional env: `BUX_WATCHDOG_FD=<fd>` (read end of parent keepalive pipe).
 | `prepare` | create libkrun ctx + apply config (never starts gvproxy) |
 | `install_seccomp` | default VMM seccomp (Linux `x86_64`/`aarch64`; Darwin no-op). Binary installs after gvproxy threads exist. |
 | `start` | `krun_start_enter` (never returns on success) |
-| `host` | host-side libkrun probes |
 | `ExitInfo` | crash diagnostics JSON |

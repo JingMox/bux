@@ -108,7 +108,7 @@ const fn map_layer(s: bux_jail::LayerStatus) -> LayerStatus {
     }
 }
 
-/// Host isolation for `Runtime::host_info`. libkrun fields are unused (engine does not load libkrun).
+/// Host isolation for `Runtime::host_info`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 #[allow(
@@ -128,12 +128,6 @@ pub struct HostInfo {
     pub cgroups: bool,
     /// Landlock LSM (Linux 5.13+).
     pub landlock: bool,
-    /// Hypervisor max vCPUs. Always `None`: the engine does not load libkrun.
-    pub max_vcpus: Option<u32>,
-    /// Nested virtualization. Always `None`: the engine does not load libkrun.
-    pub nested_virt: Option<bool>,
-    /// libkrun build features. Always empty: the engine does not load libkrun.
-    pub krun_features: Vec<String>,
     /// Isolation gaps from the jailer host audit.
     pub isolation_warnings: Vec<String>,
 }
@@ -141,9 +135,8 @@ pub struct HostInfo {
 impl HostInfo {
     /// Probe the current host.
     ///
-    /// `max_vcpus`, `nested_virt`, and `krun_features` are empty: the engine
-    /// does not load libkrun. `virtualization` still comes from the jailer
-    /// host audit (KVM / HVF).
+    /// The engine does not load libkrun. `virtualization` comes from the
+    /// jailer host audit (KVM / HVF).
     #[must_use]
     pub fn probe() -> Self {
         #[cfg(unix)]
@@ -157,9 +150,6 @@ impl HostInfo {
                 mandatory_access_control: caps.mandatory_access_control,
                 cgroups: caps.cgroups,
                 landlock: caps.landlock,
-                max_vcpus: None,
-                nested_virt: None,
-                krun_features: Vec::new(),
                 isolation_warnings: bux_jail::checks::audit_isolation(&caps),
             }
         }
@@ -172,9 +162,6 @@ impl HostInfo {
                 mandatory_access_control: false,
                 cgroups: false,
                 landlock: false,
-                max_vcpus: None,
-                nested_virt: None,
-                krun_features: Vec::new(),
                 isolation_warnings: Vec::new(),
             }
         }
@@ -202,20 +189,6 @@ mod tests {
         assert!(!s.landlock);
         assert!(s.allow_degraded);
         assert!(!s.jailer);
-    }
-
-    #[test]
-    fn probe_krun_fields_are_empty() {
-        let h = HostInfo::probe();
-        assert!(
-            h.krun_features.is_empty(),
-            "engine must not probe libkrun features"
-        );
-        assert_eq!(h.max_vcpus, None, "engine must not probe libkrun max_vcpus");
-        assert_eq!(
-            h.nested_virt, None,
-            "engine must not probe libkrun nested_virt"
-        );
     }
 
     #[cfg(target_os = "linux")]
