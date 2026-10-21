@@ -16,7 +16,7 @@ bux-proto = { version = "0.9", path = "crates/bux-proto" }
 bux-serve = { version = "0.9", path = "crates/bux-serve" }
 
 bux-bwrap = { version = "0.3", path = "crates/bux-bwrap" }
-bux-jail = { version = "0.2", path = "crates/bux-jail" }
+bux-jail = { version = "0.3", path = "crates/bux-jail" }
 bux-krun = { version = "0.3", path = "crates/bux-krun" }
 bux-shim = { version = "0.2", path = "crates/bux-shim", default-features = false }
 bux-e2fs = { version = "0.3", path = "crates/bux-e2fs" }

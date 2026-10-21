@@ -8,11 +8,16 @@
 //!
 //! The default sandbox is auto-detected at runtime. Override via
 //! [`JailConfig::sandbox`].
+//!
+//! [`spawn`] returns the shim as a [`ShimProcess`] (pid plus start time,
+//! safe against pid reuse) and, unless the VM is detached, a [`Keepalive`]
+//! that ties the shim's lifetime to this process.
 
 /// Host capability probes.
 pub mod checks;
 mod error;
 mod pre_exec;
+mod process;
 /// Security layer status types.
 pub mod security;
 
@@ -28,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 pub use error::{Error, Result};
+pub use process::{Keepalive, ShimProcess};
 pub use security::{LayerStatus, SandboxKind, SecurityReport};
 
 #[cfg(target_os = "linux")]
@@ -35,7 +41,7 @@ use bwrap::BwrapSandbox;
 #[cfg(target_os = "macos")]
 use seatbelt::SeatbeltSandbox;
 
-/// Environment variable set on the shim child when a watchdog FD is preserved.
+/// Environment variable set on the shim child when it gets a watchdog pipe.
 ///
 /// Value is the decimal file descriptor number. Must match
 /// `bux_shim::ENV_WATCHDOG_FD` / the shim binary.
@@ -118,8 +124,6 @@ pub struct JailConfig {
     pub socks_dir: PathBuf,
     /// Host paths for virtiofs mounts.
     pub virtiofs_paths: Vec<PathBuf>,
-    /// Watchdog pipe read-end FD to preserve across exec.
-    pub watchdog_fd: Option<RawFd>,
     /// Override the default platform sandbox.
     ///
     /// When `None`, auto-detects: bwrap on Linux (fail-closed without
@@ -135,7 +139,9 @@ pub struct JailConfig {
     pub landlock: bool,
     /// If true, missing Landlock (when requested) degrades instead of failing.
     pub allow_degraded_security: bool,
-    /// Kill the child when the parent dies (`PR_SET_PDEATHSIG` and bwrap `--die-with-parent`).
+    /// Tie the shim's lifetime to this process: a watchdog pipe whose
+    /// [`Keepalive`] end is returned in [`SpawnResult::keepalive`],
+    /// `PR_SET_PDEATHSIG`, and bwrap `--die-with-parent`.
     ///
     /// Default true. False when the VM is detached.
     pub die_with_parent: bool,
@@ -150,8 +156,10 @@ pub struct JailConfig {
 /// Result of spawning a shim process inside a sandbox.
 #[derive(Debug)]
 pub struct SpawnResult {
-    /// The spawned child process.
-    pub child: Child,
+    /// The spawned process (the jail parent when a sandbox wraps the shim).
+    pub process: ShimProcess,
+    /// Parent end of the watchdog pipe. `Some` iff [`JailConfig::die_with_parent`].
+    pub keepalive: Option<Keepalive>,
     /// Actual security posture for this spawn.
     pub security: SecurityReport,
 }
@@ -159,7 +167,9 @@ pub struct SpawnResult {
 /// Spawn `bux-shim` inside a sandbox.
 ///
 /// Applies platform-specific isolation, Landlock (when requested), then
-/// pre-exec hardening (FD cleanup, die-with-parent).
+/// pre-exec hardening (FD cleanup, die-with-parent). With
+/// [`JailConfig::die_with_parent`], also creates the watchdog pipe and
+/// passes its read end to the shim via [`ENV_WATCHDOG_FD`].
 ///
 /// # Errors
 ///
@@ -180,12 +190,18 @@ pub fn spawn(shim: &Path, config_path: &Path, config: JailConfig) -> Result<Spaw
     });
     cmd.stdin(Stdio::null());
 
-    let watchdog_fd = config.watchdog_fd;
     let die_with_parent = config.die_with_parent;
     if let Some(file) = config.stderr_file {
         cmd.stderr(Stdio::from(file));
     }
 
+    let (watchdog_read, keepalive) = if die_with_parent {
+        let (read_end, keepalive) = process::watchdog_pipe()?;
+        (Some(read_end), Some(keepalive))
+    } else {
+        (None, None)
+    };
+    let watchdog_fd = watchdog_read.as_ref().map(AsRawFd::as_raw_fd);
     if let Some(fd) = watchdog_fd {
         cmd.env(ENV_WATCHDOG_FD, fd.to_string());
     }
@@ -200,6 +216,8 @@ pub fn spawn(shim: &Path, config_path: &Path, config: JailConfig) -> Result<Spaw
     );
     let child = cmd.spawn()?;
     drop(landlock_owned);
+    drop(watchdog_read);
+    let process = identify(child)?;
 
     let mac = match sandbox_kind {
         SandboxKind::Seatbelt => LayerStatus::Enforced,
@@ -213,13 +231,26 @@ pub fn spawn(shim: &Path, config_path: &Path, config: JailConfig) -> Result<Spaw
     };
 
     Ok(SpawnResult {
-        child,
+        process,
+        keepalive,
         security: SecurityReport {
             sandbox: sandbox_kind,
             landlock: landlock_status,
             mac,
         },
     })
+}
+
+/// Record the child's start time; reap it if it cannot be identified.
+fn identify(mut child: Child) -> Result<ShimProcess> {
+    match ShimProcess::from_pid(child.id()) {
+        Ok(process) => Ok(process),
+        Err(e) => {
+            drop(child.kill());
+            drop(child.wait());
+            Err(e.into())
+        }
+    }
 }
 
 /// Resolve Landlock fd + status (K22).
@@ -341,7 +372,6 @@ mod tests {
             readonly_paths: vec![],
             socks_dir: PathBuf::from("/tmp/bux-socks"),
             virtiofs_paths: vec![],
-            watchdog_fd: None,
             sandbox: None,
             stderr_file: None,
             landlock: false,

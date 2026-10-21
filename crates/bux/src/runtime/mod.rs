@@ -31,7 +31,7 @@ use crate::secrets::LiveSecrets;
 use crate::snapshot::SnapshotManager;
 use crate::state::{StateDb, Status, VmConfig, VmState};
 use crate::volumes::VolumeManager;
-use boot::{clean_vm_files, is_pid_alive};
+use boot::clean_vm_files;
 use bux_oci::RegistryAuth;
 
 pub use vm::{EgressClass, Vm, VmInfo};
@@ -676,9 +676,9 @@ impl Runtime {
         Ok(())
     }
 
-    /// Mark a stored active row Stopped when the shim PID is gone.
+    /// Mark a stored active row Stopped when its shim process is gone.
     fn reconcile_dead_pid(&self, vm: &mut VmState) {
-        if vm.status.is_active() && !is_pid_alive(vm.pid) {
+        if vm.status.is_active() && !vm.process().is_alive() {
             vm.status = Status::Stopped;
             drop(self.db.update_status(&vm.id, Status::Stopped));
             clean_vm_files(&vm.socket);
@@ -792,6 +792,7 @@ mod tests {
     use crate::secrets::{LiveSecrets, StartOptions};
     use crate::state::VmConfig;
     use crate::volumes::{VolumeMount, VolumeSource};
+    use bux_jail::ShimProcess;
     use bux_oci::RegistryAuth;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -799,20 +800,21 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
-    fn insert_running(rt: &Runtime, id: &str, pid: i32) {
-        insert_running_cfg(rt, id, pid, VmConfig::default());
+    fn insert_running(rt: &Runtime, id: &str, shim: ShimProcess) {
+        insert_running_cfg(rt, id, shim, VmConfig::default());
     }
 
-    fn insert_running_cfg(rt: &Runtime, id: &str, pid: i32, config: VmConfig) {
-        insert_cfg(rt, id, pid, Status::Running, config);
+    fn insert_running_cfg(rt: &Runtime, id: &str, shim: ShimProcess, config: VmConfig) {
+        insert_cfg(rt, id, shim, Status::Running, config);
     }
 
-    fn insert_cfg(rt: &Runtime, id: &str, pid: i32, status: Status, config: VmConfig) {
+    fn insert_cfg(rt: &Runtime, id: &str, shim: ShimProcess, status: Status, config: VmConfig) {
         rt.db
             .insert(&VmState {
                 id: id.to_owned(),
                 name: None,
-                pid,
+                pid: shim.pid(),
+                start_time: shim.start_time(),
                 image: None,
                 socket: rt.socks_dir.join(format!("{id}.sock")),
                 status,
@@ -822,12 +824,12 @@ mod tests {
             .unwrap();
     }
 
-    fn wait_dead_pid() -> i32 {
+    fn dead_shim() -> ShimProcess {
         // Sidecar tests empty PATH under a mutex.
         let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
-        let pid = child_pid(&child);
+        let shim = child_shim(&child);
         drop(child.wait());
-        pid
+        shim
     }
 
     fn shim_json(rt: &Runtime, id: &str) -> PathBuf {
@@ -847,8 +849,8 @@ mod tests {
             .unwrap()
     }
 
-    fn child_pid(child: &std::process::Child) -> i32 {
-        i32::try_from(child.id()).unwrap()
+    fn child_shim(child: &std::process::Child) -> ShimProcess {
+        ShimProcess::from_pid(child.id()).unwrap()
     }
 
     fn dummy_offline_runtime() -> (tempfile::TempDir, Runtime, PathBuf) {
@@ -872,7 +874,7 @@ mod tests {
         insert_cfg(
             rt,
             id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig {
                 auto_stop_secs: Some(1),
@@ -893,11 +895,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rt = Runtime::open(dir.path()).unwrap();
         let mut child = spawn_sleep();
-        let pid = child_pid(&child);
-        insert_running(&rt, "aabbccddeeff", pid);
+        let shim = child_shim(&child);
+        insert_running(&rt, "aabbccddeeff", shim);
         let list = rt.list().unwrap();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].pid, pid);
+        assert_eq!(list[0].pid, shim.pid());
         assert_eq!(list[0].status, Status::Running);
         drop(rt);
         drop(child.kill());
@@ -908,13 +910,13 @@ mod tests {
     fn list_marks_dead_pid_stopped() {
         let dir = tempfile::tempdir().unwrap();
         let rt = Runtime::open(dir.path()).unwrap();
-        let dead = wait_dead_pid();
+        let dead = dead_shim();
         insert_running(&rt, "deadpid000001", dead);
         let json = plant_shim_json(&rt, "deadpid000001");
         let list = rt.list().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].status, Status::Stopped);
-        assert_eq!(list[0].pid, dead);
+        assert_eq!(list[0].pid, dead.pid());
         assert!(
             !json.exists(),
             "reconcile_dead_pid must unlink leftover shim JSON"
@@ -922,21 +924,67 @@ mod tests {
     }
 
     #[test]
-    fn update_pid_then_list_sees_new_pid() {
+    fn list_marks_reused_pid_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = Runtime::open(dir.path()).unwrap();
+        let mut child = spawn_sleep();
+        let live = child_shim(&child);
+        // Same pid, other start time: the recorded shim is gone and an
+        // unrelated process holds its pid.
+        let stale = ShimProcess::open(live.pid(), live.start_time() + 1);
+        insert_running(&rt, "reusedpid0001", stale);
+        let list = rt.list().unwrap();
+        assert_eq!(list[0].status, Status::Stopped);
+        drop(rt);
+        assert!(live.is_alive(), "a reused pid must never be signalled");
+        drop(child.kill());
+        drop(child.wait());
+    }
+
+    #[test]
+    fn drop_and_recover_skip_reused_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = spawn_sleep();
+        let live = child_shim(&child);
+        let stale = ShimProcess::open(live.pid(), live.start_time() + 1);
+        {
+            let rt = Runtime::open(dir.path()).unwrap();
+            insert_running(&rt, "reusedpid0002", stale);
+            drop(rt);
+        }
+        assert!(live.is_alive(), "Runtime Drop must not signal a reused pid");
+        let rt = Runtime::open(dir.path()).unwrap();
+        let row = rt.db.get_by_id_prefix("reusedpid0002").unwrap();
+        assert_eq!(row.status, Status::Stopped, "recover marks it stopped");
+        drop(rt);
+        assert!(live.is_alive(), "recover must not signal a reused pid");
+        drop(child.kill());
+        drop(child.wait());
+    }
+
+    #[test]
+    fn update_process_then_list_sees_new_process() {
         let dir = tempfile::tempdir().unwrap();
         let rt = Runtime::open(dir.path()).unwrap();
         let mut dead_child = std::process::Command::new("true").spawn().unwrap();
-        let dead = child_pid(&dead_child);
+        let dead = child_shim(&dead_child);
         drop(dead_child.wait());
         insert_running(&rt, "aabbccddeeff", dead);
         let mut live_child = spawn_sleep();
-        let live = child_pid(&live_child);
+        let live = child_shim(&live_child);
         rt.db
-            .update_pid_status("aabbccddeeff", live, Status::Running)
+            .update_process_status(
+                "aabbccddeeff",
+                live.pid(),
+                live.start_time(),
+                Status::Running,
+            )
             .unwrap();
         let list = rt.list().unwrap();
-        assert_eq!(list[0].pid, live);
+        assert_eq!(list[0].pid, live.pid());
         assert_eq!(list[0].status, Status::Running);
+        let row = rt.db.get_by_id_prefix("aabbccddeeff").unwrap();
+        assert_eq!(row.process(), live);
         drop(rt);
         drop(live_child.kill());
         drop(live_child.wait());
@@ -946,13 +994,13 @@ mod tests {
     fn drop_skips_detached_live_pid() {
         let dir = tempfile::tempdir().unwrap();
         let mut child = spawn_sleep();
-        let pid = child_pid(&child);
+        let shim = child_shim(&child);
         {
             let rt = Runtime::open(dir.path()).unwrap();
             insert_running_cfg(
                 &rt,
                 "detachdead0001",
-                pid,
+                shim,
                 VmConfig {
                     detach: true,
                     ..VmConfig::default()
@@ -960,10 +1008,7 @@ mod tests {
             );
             drop(rt);
         }
-        assert!(
-            is_pid_alive(pid),
-            "Runtime Drop must not SIGTERM detach=true"
-        );
+        assert!(shim.is_alive(), "Runtime Drop must not SIGTERM detach=true");
         drop(child.kill());
         drop(child.wait());
     }
@@ -1073,7 +1118,7 @@ mod tests {
         insert_cfg(
             &rt,
             vm_id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig::default(),
         );
@@ -1126,7 +1171,7 @@ mod tests {
         insert_cfg(
             &rt,
             vm_id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig {
                 vcpus: 2,
@@ -1195,18 +1240,20 @@ mod tests {
         insert_cfg(
             &rt,
             src_id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig {
                 ram_mib: 512,
                 ..VmConfig::default()
             },
         );
+        let decoy = dead_shim();
         rt.db
             .insert(&VmState {
                 id: decoy_id.to_owned(),
                 name: Some(src_id.to_owned()),
-                pid: wait_dead_pid(),
+                pid: decoy.pid(),
+                start_time: decoy.start_time(),
                 image: None,
                 socket: rt.socks_dir.join(format!("{decoy_id}.sock")),
                 status: Status::Stopped,
@@ -1250,18 +1297,20 @@ mod tests {
         insert_cfg(
             &rt,
             src_id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig {
                 ram_mib: 512,
                 ..VmConfig::default()
             },
         );
+        let decoy = dead_shim();
         rt.db
             .insert(&VmState {
                 id: decoy_id.to_owned(),
                 name: Some(src_id.to_owned()),
-                pid: wait_dead_pid(),
+                pid: decoy.pid(),
+                start_time: decoy.start_time(),
                 image: None,
                 socket: rt.socks_dir.join(format!("{decoy_id}.sock")),
                 status: Status::Stopped,
@@ -1305,12 +1354,12 @@ mod tests {
     fn recover_live_secrets_shim_is_vsock_only() {
         let dir = tempfile::tempdir().unwrap();
         let mut child = spawn_sleep();
-        let pid = child_pid(&child);
+        let shim = child_shim(&child);
         let rt = Runtime::open(dir.path()).unwrap();
         insert_running_cfg(
             &rt,
             "secretlive0001",
-            pid,
+            shim,
             VmConfig {
                 detach: true,
                 secrets_required: true,
@@ -1320,7 +1369,7 @@ mod tests {
         let json = plant_shim_json(&rt, "secretlive0001");
         rt.recover();
         assert!(
-            is_pid_alive(pid),
+            shim.is_alive(),
             "live secrets + live shim must not be SIGTERM'd"
         );
         assert!(
@@ -1330,7 +1379,7 @@ mod tests {
         let row = rt.db.get_by_id_prefix("secretlive0001").unwrap();
         assert_eq!(row.status, Status::Running);
         drop(rt);
-        assert!(is_pid_alive(pid));
+        assert!(shim.is_alive());
         drop(child.kill());
         drop(child.wait());
     }
@@ -1339,7 +1388,7 @@ mod tests {
     fn recover_dead_unlinks_shim_json() {
         let dir = tempfile::tempdir().unwrap();
         let rt = Runtime::open(dir.path()).unwrap();
-        let dead = wait_dead_pid();
+        let dead = dead_shim();
         insert_running(&rt, "deadjson000001", dead);
         let json = plant_shim_json(&rt, "deadjson000001");
         rt.recover();
@@ -1355,7 +1404,7 @@ mod tests {
     fn recover_dead_auto_remove_purges_shim_json_once() {
         let dir = tempfile::tempdir().unwrap();
         let rt = Runtime::open(dir.path()).unwrap();
-        let dead = wait_dead_pid();
+        let dead = dead_shim();
         insert_running_cfg(
             &rt,
             "deadauto000001",
@@ -1378,7 +1427,7 @@ mod tests {
     fn sweep_auto_stop_unlinks_shim_json() {
         let dir = tempfile::tempdir().unwrap();
         let rt = Runtime::open(dir.path()).unwrap();
-        let dead = wait_dead_pid();
+        let dead = dead_shim();
         insert_running_cfg(
             &rt,
             "sweepjson00001",
@@ -1409,7 +1458,7 @@ mod tests {
         insert_cfg(
             &rt,
             id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig {
                 auto_remove: true,
@@ -1454,7 +1503,7 @@ mod tests {
         insert_cfg(
             &rt,
             id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig {
                 auto_remove: false,
@@ -1485,7 +1534,7 @@ mod tests {
         insert_cfg(
             &rt,
             id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig {
                 auto_remove: false,
@@ -1517,7 +1566,7 @@ mod tests {
         insert_cfg(
             &rt,
             auto_id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig {
                 auto_remove: true,
@@ -1527,7 +1576,7 @@ mod tests {
         insert_cfg(
             &rt,
             named_id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig::default(),
         );
@@ -1551,14 +1600,14 @@ mod tests {
     fn sweep_auto_delete_does_not_delete_name_colliding_with_id() {
         let dir = tempfile::tempdir().unwrap();
         let mut child = spawn_sleep();
-        let live = child_pid(&child);
+        let live = child_shim(&child);
         let rt = Runtime::open(dir.path()).unwrap();
         let delete_id = "aaaaaaaaaaaa";
         let named_id = "bbbbbbbbbbbb";
         insert_cfg(
             &rt,
             delete_id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig {
                 auto_delete_secs: Some(1),
@@ -1583,7 +1632,7 @@ mod tests {
         let named = rt.db.get_by_id_prefix(named_id).unwrap();
         assert_eq!(named.id, named_id);
         assert_eq!(named.status, Status::Running);
-        assert!(is_pid_alive(live));
+        assert!(live.is_alive());
         drop(rt);
         drop(child.kill());
         drop(child.wait());
@@ -1670,7 +1719,7 @@ mod tests {
         insert_cfg(
             &rt,
             "getshim000001",
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig::default(),
         );
@@ -1765,14 +1814,14 @@ mod tests {
         insert_cfg(
             &rt,
             "abc123def456",
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig::default(),
         );
         insert_cfg(
             &rt,
             "abc999000111",
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig::default(),
         );
@@ -1826,7 +1875,7 @@ mod tests {
         insert_cfg(
             &rt,
             "namedvm000001",
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig::default(),
         );
@@ -1937,7 +1986,7 @@ mod tests {
         insert_cfg(
             &rt,
             id,
-            wait_dead_pid(),
+            dead_shim(),
             Status::Stopped,
             VmConfig {
                 last_activity_at: Some(SystemTime::UNIX_EPOCH),

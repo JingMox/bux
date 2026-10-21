@@ -6,17 +6,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use bux_jail::{Keepalive, ShimProcess};
 use bux_proto::ExecStart;
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
 use serde::Serialize;
 use tracing::info;
 
 use super::HealthStatus;
 use super::boot::{
     agent_not_ready_message, clean_net_sock, clean_unready_files, clean_vm_files, clean_vsock_sock,
-    inject_guest_boot_env, is_pid_alive, prepare_restart_config, prepare_virtio_net,
-    shim_death_message, spawn_shim, wait_for_exit,
+    inject_guest_boot_env, prepare_restart_config, prepare_virtio_net, shim_death_message,
+    spawn_shim,
 };
 use crate::Result;
 use crate::client::{Client, ExecHandle, ExecOutput, PongInfo};
@@ -31,7 +30,6 @@ use crate::security::{SecurityOptions, SecurityStatus};
 use crate::snapshot::SnapshotManager;
 use crate::state::{StateDb, Status, VmState};
 use crate::volumes::VolumeManager;
-use crate::watchdog::Keepalive;
 
 /// Inspect JSON egress label derived from [`NetworkSpec`].
 ///
@@ -85,7 +83,7 @@ pub struct VmInfo {
     /// Optional unique name.
     pub name: Option<String>,
     /// Shim process PID.
-    pub pid: i32,
+    pub pid: u32,
     /// Image label (OCI ref or path).
     pub image: Option<String>,
     /// Lifecycle status.
@@ -129,7 +127,7 @@ pub struct VmInfo {
 impl VmInfo {
     /// Project stored state into a product view (no guest ping).
     pub(crate) fn from_stored(state: &VmState) -> Self {
-        let health = if state.status == Status::Stopped || !is_pid_alive(state.pid) {
+        let health = if state.status == Status::Stopped || !state.process().is_alive() {
             HealthStatus::Dead
         } else {
             HealthStatus::Starting
@@ -257,7 +255,7 @@ impl Vm {
     pub(super) fn abort_unready(&mut self) {
         let uptime_ms = u64::try_from(self.spawned_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.runtime_metrics.on_vm_failed(uptime_ms);
-        signal::kill(Pid::from_raw(self.state.pid), Signal::SIGKILL).ok();
+        self.state.process().kill().ok();
         self.secrets
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -615,22 +613,13 @@ impl Vm {
         )?;
 
         self.state.config.security_status = shim.security.clone();
-        if let Err(e) = self
-            .db
-            .update_pid_status(&self.state.id, shim.pid, Status::Running)
-            .and_then(|()| self.db.update_config(&self.state.id, &self.state.config))
-        {
-            self.revert_failed_start(shim.pid);
-            return Err(e);
-        }
-        self.state.pid = shim.pid;
-        self.state.status = Status::Running;
+        self.commit_started(shim.process)?;
         self.client = Client::new(&self.state.socket);
         self.keepalive = shim.keepalive;
 
         info!(
             vm_id = %self.state.id,
-            pid = shim.pid,
+            pid = shim.process.pid(),
             network_enabled = self.state.config.network.is_enabled(),
             secrets = self.state.config.secrets_required,
             "VM restarted"
@@ -665,7 +654,7 @@ impl Vm {
     }
 
     /// Graceful shutdown: sends `Shutdown` request, waits up to `timeout`,
-    /// then falls back to `SIGKILL`.
+    /// then kills the shim.
     ///
     /// # Errors
     ///
@@ -683,12 +672,10 @@ impl Vm {
 
         drop(self.client.shutdown().await);
 
-        let pid = self.state.pid;
-        let result = tokio::time::timeout(
-            timeout,
-            tokio::task::spawn_blocking(move || wait_for_exit(pid)),
-        )
-        .await;
+        let process = self.state.process();
+        let result =
+            tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || process.wait()))
+                .await;
 
         if result.is_ok() {
             return self.mark_stopped();
@@ -696,31 +683,28 @@ impl Vm {
         self.kill()
     }
 
-    /// Sends `SIGKILL` to the VM process.
+    /// Kills the VM process.
     ///
     /// # Errors
     ///
     /// Returns an error if the status update fails.
     pub fn kill(&mut self) -> Result<()> {
-        signal::kill(Pid::from_raw(self.state.pid), Signal::SIGKILL).ok();
+        self.state.process().kill().ok();
         self.mark_stopped()
     }
 
     /// Returns `true` if the VM process is still alive.
     pub fn is_alive(&self) -> bool {
-        is_pid_alive(self.state.pid)
+        self.state.process().is_alive()
     }
 
     /// Sends a POSIX signal to the VM process.
     ///
     /// # Errors
     ///
-    /// Returns an error if the signal number is invalid or delivery fails.
+    /// Returns an error if the signal number is invalid or the process is gone.
     pub fn signal(&self, sig: i32) -> Result<()> {
-        let signal =
-            Signal::try_from(sig).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        signal::kill(Pid::from_raw(self.state.pid), signal)?;
-        Ok(())
+        Ok(self.state.process().signal(sig)?)
     }
 
     /// Waits for the VM process to exit.
@@ -729,8 +713,8 @@ impl Vm {
     ///
     /// Returns an error if the status update fails.
     pub async fn wait(&mut self) -> Result<()> {
-        let pid = self.state.pid;
-        drop(tokio::task::spawn_blocking(move || wait_for_exit(pid)).await);
+        let process = self.state.process();
+        drop(tokio::task::spawn_blocking(move || process.wait()).await);
         self.mark_stopped()
     }
 
@@ -746,7 +730,8 @@ impl Vm {
     )]
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
         let start = std::time::Instant::now();
-        let pid = self.state.pid;
+        let process = self.state.process();
+        let pid = process.pid();
         let exit_file = self.state.socket.with_extension("exit");
 
         let handshake_loop = async {
@@ -760,7 +745,7 @@ impl Vm {
 
         let process_monitor = async {
             loop {
-                if !is_pid_alive(pid) {
+                if !process.is_alive() {
                     return Err(crate::Error::GuestUnavailable(shim_death_message(
                         pid, &exit_file,
                     )));
@@ -884,12 +869,33 @@ impl Vm {
         Ok(self.client.handshake().await?)
     }
 
+    /// Persist a freshly spawned shim as Running; kill it if that fails.
+    fn commit_started(&mut self, process: ShimProcess) -> Result<()> {
+        let persisted = self
+            .db
+            .update_process_status(
+                &self.state.id,
+                process.pid(),
+                process.start_time(),
+                Status::Running,
+            )
+            .and_then(|()| self.db.update_config(&self.state.id, &self.state.config));
+        if let Err(e) = persisted {
+            self.revert_failed_start(process);
+            return Err(e);
+        }
+        self.state.pid = process.pid();
+        self.state.start_time = process.start_time();
+        self.state.status = Status::Running;
+        Ok(())
+    }
+
     /// Kill a shim that started but was not committed as Running.
     ///
     /// Leaves the handle Stopped so `start_with` can be retried. Best-effort
-    /// `update_status(Stopped)` covers a pid row that already landed.
-    fn revert_failed_start(&mut self, pid: i32) {
-        signal::kill(Pid::from_raw(pid), Signal::SIGKILL).ok();
+    /// `update_status(Stopped)` covers a row whose new process already landed.
+    fn revert_failed_start(&mut self, process: ShimProcess) {
+        process.kill().ok();
         clean_vsock_sock(&self.state.socket);
         clean_net_sock(&self.state.socket);
         self.state.status = Status::Stopped;
@@ -939,6 +945,7 @@ mod tests {
             id: "aabbccddeeff".into(),
             name: None,
             pid: 1,
+            start_time: 0,
             image: None,
             socket: PathBuf::from("/tmp/x.sock"),
             status: Status::Stopped,
@@ -990,6 +997,7 @@ mod tests {
             id: "aabbccddeeff".into(),
             name: Some("n1".into()),
             pid: 1,
+            start_time: 0,
             image: Some("docker.io/library/python:slim".into()),
             socket: PathBuf::from("/tmp/x.sock"),
             status: Status::Stopped,

@@ -237,7 +237,7 @@ mod tests {
 
     fn plant_vm(data_dir: &Path, id: &str, image: Option<&str>, tenant: &str) {
         let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
+        let pid = child.id();
         drop(child.wait());
         let socket = data_dir.join("socks").join(format!("{id}.sock"));
         let conn = rusqlite::Connection::open(data_dir.join("bux.db")).unwrap();
@@ -249,8 +249,8 @@ mod tests {
             "agent_id": "a1",
         });
         conn.execute(
-            "INSERT INTO vms (id, name, pid, image, socket, status, config, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'stopped', ?6, 0)",
+            "INSERT INTO vms (id, name, pid, start_time, image, socket, status, config, created_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, 'stopped', ?6, 0)",
             params![
                 id,
                 format!("a-{tenant}-a1"),

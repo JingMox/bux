@@ -16,7 +16,7 @@ pub(super) use spawn::spawn_shim;
 pub(super) use unix::stderr_tail;
 pub(super) use unix::{
     agent_not_ready_message, clean_net_sock, clean_unready_files, clean_vm_files, clean_vsock_sock,
-    is_pid_alive, prepare_virtio_net, shim_death_message, wait_for_exit,
+    prepare_virtio_net, shim_death_message,
 };
 
 use std::io;

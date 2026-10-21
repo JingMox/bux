@@ -542,6 +542,7 @@ mod tests {
             id: "vm1".into(),
             name: None,
             pid: 1,
+            start_time: 0,
             image: None,
             socket: dir.path().join("vm1.sock"),
             status: crate::state::Status::Running,

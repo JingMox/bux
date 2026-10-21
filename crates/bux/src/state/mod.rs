@@ -298,8 +298,11 @@ pub(crate) struct VmState {
     pub id: String,
     /// Optional human-friendly name (unique across the runtime).
     pub name: Option<String>,
-    /// Host PID of the VM process (matches `libc::pid_t`).
-    pub pid: i32,
+    /// Host PID of the VM process.
+    pub pid: u32,
+    /// Start time of that process, so a reused PID is not mistaken for it
+    /// (see [`bux_jail::ShimProcess::start_time`]).
+    pub start_time: u64,
     /// OCI image reference (if pulled from a registry).
     pub image: Option<String>,
     /// Unix socket path for host↔guest communication.
@@ -310,6 +313,14 @@ pub(crate) struct VmState {
     pub config: VmConfig,
     /// Timestamp when the VM was created.
     pub created_at: SystemTime,
+}
+
+#[cfg(unix)]
+impl VmState {
+    /// The VM process recorded in this row.
+    pub(crate) const fn process(&self) -> bux_jail::ShimProcess {
+        bux_jail::ShimProcess::open(self.pid, self.start_time)
+    }
 }
 
 /// Generates a 12-character hex VM identifier.
@@ -357,6 +368,7 @@ mod tests {
             id: id.to_owned(),
             name: name.map(ToOwned::to_owned),
             pid: 1234,
+            start_time: 42,
             image: Some("alpine:latest".to_owned()),
             socket: format!("/tmp/{id}.sock").into(),
             status: Status::Running,
@@ -385,6 +397,7 @@ mod tests {
         assert_eq!(all[0].id, "aaa111bbb222");
         assert_eq!(all[0].name.as_deref(), Some("myvm"));
         assert_eq!(all[0].pid, 1234);
+        assert_eq!(all[0].start_time, 42);
         assert_eq!(all[0].status, Status::Running);
     }
 
@@ -477,14 +490,15 @@ mod tests {
     }
 
     #[test]
-    fn update_pid_status_persists_new_pid() {
+    fn update_process_status_persists_new_process() {
         let db = open_test_db();
         db.insert(&test_vm("aaa111", None)).unwrap();
 
-        db.update_pid_status("aaa111", 5678, Status::Running)
+        db.update_process_status("aaa111", 5678, 99, Status::Running)
             .unwrap();
         let vm = db.get_by_id_prefix("aaa111").unwrap();
         assert_eq!(vm.pid, 5678);
+        assert_eq!(vm.start_time, 99);
         assert_eq!(vm.status, Status::Running);
     }
 
@@ -518,14 +532,16 @@ mod tests {
     }
 
     #[test]
-    fn pid_stored_as_i32() {
+    fn process_identity_round_trips_full_range() {
         let db = open_test_db();
         let mut vm = test_vm("aaa111", None);
-        vm.pid = -1; // Negative PID should survive round-trip.
+        vm.pid = u32::MAX;
+        vm.start_time = u64::MAX; // Stored as a bit-cast i64.
         db.insert(&vm).unwrap();
 
         let loaded = db.get_by_id_prefix("aaa111").unwrap();
-        assert_eq!(loaded.pid, -1);
+        assert_eq!(loaded.pid, u32::MAX);
+        assert_eq!(loaded.start_time, u64::MAX);
     }
 
     #[test]
