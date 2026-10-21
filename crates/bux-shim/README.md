@@ -8,8 +8,12 @@ The process-takeover binary lives in `bux-shim-bin` (`[[bin]] name = "bux-shim"`
 - libkrun **process takeover** must not run inside the host tokio Runtime.
 - Host `bux` maps product state → `ShimConfig` JSON; shim never depends on `bux`.
 - Virtio-net via `add_net_unixstream` / `add_net_unixgram`. The shim never
-  calls TSI `set_port_map`. When `network` is `None`, implicit TSI is
-  disabled (`disable_implicit_vsock` + `add_vsock(0)`).
+  calls TSI `set_port_map`. The vsock device is always explicit with TSI
+  off (`disable_implicit_vsock` + `add_vsock(0)`), with or without
+  `network`.
+- A directory root is a virtio-fs device tagged `/dev/root`
+  (`add_virtiofs3`), not `krun_set_root`, which the smolvm libkrun fork
+  lacks.
 
 ## Wire format
 
@@ -29,5 +33,4 @@ Optional env: `BUX_WATCHDOG_FD=<fd>` (read end of parent keepalive pipe).
 | `prepare` | create libkrun ctx + apply config (never starts gvproxy) |
 | `install_seccomp` | default VMM seccomp (Linux `x86_64`/`aarch64`; Darwin no-op). Binary installs after gvproxy threads exist. |
 | `start` | `krun_start_enter` (never returns on success) |
-| `host` | host-side libkrun probes |
 | `ExitInfo` | crash diagnostics JSON |

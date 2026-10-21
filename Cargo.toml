@@ -17,8 +17,8 @@ bux-serve = { version = "0.9", path = "crates/bux-serve" }
 
 bux-bwrap = { version = "0.3", path = "crates/bux-bwrap" }
 bux-jail = { version = "0.2", path = "crates/bux-jail" }
-bux-krun = { version = "0.3", path = "crates/bux-krun" }
-bux-shim = { version = "0.2", path = "crates/bux-shim", default-features = false }
+bux-krun = { version = "0.4", path = "crates/bux-krun" }
+bux-shim = { version = "0.3", path = "crates/bux-shim", default-features = false }
 bux-e2fs = { version = "0.3", path = "crates/bux-e2fs" }
 bux-gvproxy = { version = "0.2", path = "crates/bux-gvproxy" }
 bux-landlock = { version = "0.2", path = "crates/bux-landlock" }
@@ -30,8 +30,8 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "json
 clap = { version = "4.6.6", features = ["derive"] }
 clap_complete = "4.6.9"
 colored = "3.1.1"
-dirs = "6.0.0"
-oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
+dirs = "7.0.0"
+oci-client = { version = "0.18.0", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"

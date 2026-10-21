@@ -10,8 +10,6 @@ mod config;
 mod crash;
 mod error;
 mod exit_info;
-#[cfg(feature = "krun")]
-pub mod host;
 mod watchdog;
 
 #[cfg(feature = "krun")]
