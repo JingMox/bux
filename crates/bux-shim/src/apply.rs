@@ -128,7 +128,7 @@ fn apply_all(ctx: u32, cfg: &ShimConfig) -> Result<()> {
 
     match (&cfg.rootfs, &cfg.root_disk) {
         (Some(root), None) => {
-            sys::set_root(ctx, root)?;
+            add_virtiofs3(ctx, ROOT_TAG, root, ROOT_SHM_SIZE, false)?;
         }
         (None, Some(disk)) => {
             let sys_fmt = match cfg.disk_format {
@@ -155,7 +155,6 @@ fn apply_all(ctx: u32, cfg: &ShimConfig) -> Result<()> {
     }
 
     // Virtio-net only. Never `set_port_map`.
-    // Skipping `add_net_*` would auto-enable TSI (host-stack leak).
     if let Some(ref net) = cfg.network {
         const FEATURES: u32 = bux_krun::sys::COMPAT_NET_FEATURES;
         let flags = match net.connection {
@@ -172,10 +171,11 @@ fn apply_all(ctx: u32, cfg: &ShimConfig) -> Result<()> {
             }
         }
     }
-    if cfg.network.is_none() {
-        disable_implicit_vsock(ctx)?;
-        add_vsock(ctx, 0)?;
-    }
+    // Explicit vsock with TSI off, networked or not. Upstream libkrun would
+    // otherwise add an implicit vsock (with TSI when there is no virtio-net);
+    // the smolvm fork adds none, which would leave the agent unreachable.
+    disable_implicit_vsock(ctx)?;
+    add_vsock(ctx, 0)?;
 
     if let Some(ref exec_path) = cfg.exec_path {
         sys::set_exec(ctx, exec_path, &cfg.exec_args, cfg.env.as_deref())?;
@@ -189,6 +189,13 @@ fn apply_all(ctx: u32, cfg: &ShimConfig) -> Result<()> {
 
     Ok(())
 }
+
+/// Virtio-fs tag libkrun boots from (`KRUN_FS_ROOT_TAG`). libkrun injects
+/// its init into this device, as `krun_set_root` does.
+const ROOT_TAG: &str = "/dev/root";
+
+/// DAX window `krun_set_root` gives the root (512 MiB).
+const ROOT_SHM_SIZE: u64 = 1 << 29;
 
 /// Disabled DAX window for `krun_add_virtiofs3`.
 const VIRTIOFS_SHM_SIZE: u64 = 0;
@@ -208,6 +215,7 @@ fn add_virtiofs_share(ctx: u32, share: &crate::config::ShimVirtioFs) -> Result<(
 fn add_virtiofs3(ctx: u32, tag: &str, path: &str, shm_size: u64, read_only: bool) -> Result<()> {
     #[cfg(test)]
     krun_spy::record(krun_spy::Call::AddVirtioFs3 {
+        tag: tag.to_owned(),
         shm_size,
         read_only,
     });
@@ -231,16 +239,22 @@ fn add_vsock(ctx: u32, tsi_features: u32) -> Result<()> {
 #[cfg(test)]
 #[allow(
     clippy::missing_docs_in_private_items,
-    reason = "test spy for TSI-off FFI order"
+    reason = "test spy for root and TSI-off FFI order"
 )]
 mod krun_spy {
     use std::cell::RefCell;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub(super) enum Call {
         DisableImplicitVsock,
-        AddVsock { tsi_features: u32 },
-        AddVirtioFs3 { shm_size: u64, read_only: bool },
+        AddVsock {
+            tsi_features: u32,
+        },
+        AddVirtioFs3 {
+            tag: String,
+            shm_size: u64,
+            read_only: bool,
+        },
     }
 
     thread_local! {
@@ -267,7 +281,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::{ShimDiskFormat, ShimVirtioFs, ShimVsockPort};
+    use crate::config::{ShimDiskFormat, ShimNetConn, ShimNetwork, ShimVirtioFs, ShimVsockPort};
 
     fn offline_cfg(rootfs: &str, vsock: &str) -> ShimConfig {
         ShimConfig {
@@ -312,6 +326,27 @@ mod tests {
     }
 
     #[test]
+    fn root_tag_matches_libkrun_header() {
+        assert_eq!(
+            format!("{ROOT_TAG}\0").as_bytes(),
+            bux_krun::sys::KRUN_FS_ROOT_TAG,
+        );
+    }
+
+    /// Calls `prepare` must make for a directory root, before any vsock port.
+    fn dir_root_calls() -> [krun_spy::Call; 3] {
+        [
+            krun_spy::Call::AddVirtioFs3 {
+                tag: ROOT_TAG.into(),
+                shm_size: ROOT_SHM_SIZE,
+                read_only: false,
+            },
+            krun_spy::Call::DisableImplicitVsock,
+            krun_spy::Call::AddVsock { tsi_features: 0 },
+        ]
+    }
+
+    #[test]
     fn prepare_disabled_network_disables_tsi() {
         drop(krun_spy::take());
         let dir = scratch_dir();
@@ -325,13 +360,32 @@ mod tests {
 
         let prepared = prepare(&cfg).expect("prepare network=None");
         assert!(prepared.ctx().is_some());
-        assert_eq!(
-            krun_spy::take(),
-            [
-                krun_spy::Call::DisableImplicitVsock,
-                krun_spy::Call::AddVsock { tsi_features: 0 },
-            ]
+        assert_eq!(krun_spy::take(), dir_root_calls());
+        drop(prepared);
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn prepare_network_adds_explicit_vsock() {
+        drop(krun_spy::take());
+        let dir = scratch_dir();
+        let rootfs = dir.join("root");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let vsock = dir.join("agent.sock");
+        let mut cfg = offline_cfg(
+            rootfs.to_str().expect("utf8 rootfs"),
+            vsock.to_str().expect("utf8 vsock"),
         );
+        // libkrun records the backend path; nothing connects before start.
+        cfg.network = Some(ShimNetwork {
+            socket_path: dir.join("net.sock"),
+            connection: ShimNetConn::UnixStream,
+            mac: [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee],
+        });
+
+        let prepared = prepare(&cfg).expect("prepare with network");
+        assert!(prepared.ctx().is_some());
+        assert_eq!(krun_spy::take(), dir_root_calls());
         drop(prepared);
         drop(std::fs::remove_dir_all(&dir));
     }
@@ -355,10 +409,12 @@ mod tests {
             krun_spy::take(),
             [
                 krun_spy::Call::AddVirtioFs3 {
+                    tag: "vol0".into(),
                     shm_size: 0,
                     read_only: true,
                 },
                 krun_spy::Call::AddVirtioFs3 {
+                    tag: "vol1".into(),
                     shm_size: 0,
                     read_only: false,
                 },

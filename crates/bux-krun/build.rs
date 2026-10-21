@@ -44,6 +44,36 @@ const LIBKRUNFW_VERSION: &str = "5.5.0";
 #[cfg(feature = "regenerate")]
 const HEADER_URL_BASE: &str = "https://raw.githubusercontent.com/libkrun/libkrun";
 
+/// `krun_*` functions wrapped by `ctx`: the calls bux makes that have the
+/// same signature in upstream libkrun 1.19 and the smolvm fork.
+#[cfg(feature = "regenerate")]
+const FUNCTIONS: &[&str] = &[
+    "krun_create_ctx",
+    "krun_free_ctx",
+    "krun_start_enter",
+    "krun_set_vm_config",
+    "krun_set_exec",
+    "krun_set_env",
+    "krun_add_virtiofs3",
+    "krun_add_disk2",
+    "krun_set_root_disk_remount",
+    "krun_add_net_unixstream",
+    "krun_add_net_unixgram",
+    "krun_add_vsock_port2",
+    "krun_add_vsock",
+    "krun_disable_implicit_vsock",
+];
+
+/// Constants used by `ctx` and its callers.
+#[cfg(feature = "regenerate")]
+const VARS: &[&str] = &[
+    "KRUN_FS_ROOT_TAG",
+    "KRUN_DISK_FORMAT_RAW",
+    "KRUN_DISK_FORMAT_QCOW2",
+    "NET_FLAG_VFKIT",
+    "COMPAT_NET_FEATURES",
+];
+
 /// GitHub repository for downloading pre-built library releases.
 const GITHUB_REPO: &str = "qntx/bux";
 
@@ -107,14 +137,16 @@ fn download_header(out_dir: &Path) -> PathBuf {
 fn generate_bindings(header: &Path, out_dir: &Path) {
     let out_file = out_dir.join("bindings.rs");
 
-    let bindings = bindgen::Builder::default()
+    let mut builder = bindgen::Builder::default()
         .header(header.to_str().expect("path is not valid UTF-8"))
-        .use_core()
-        .allowlist_function("krun_.*")
-        .allowlist_var("KRUN_.*")
-        .allowlist_var("NET_.*")
-        .allowlist_var("COMPAT_.*")
-        .allowlist_var("VIRGLRENDERER_.*")
+        .use_core();
+    for name in FUNCTIONS {
+        builder = builder.allowlist_function(name);
+    }
+    for name in VARS {
+        builder = builder.allowlist_var(name);
+    }
+    let bindings = builder
         .derive_debug(true)
         .derive_default(true)
         .derive_eq(true)
