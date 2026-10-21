@@ -22,6 +22,8 @@
 )]
 
 use std::ffi::{CString, c_char};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use std::os::fd::{FromRawFd, OwnedFd};
 
 use crate::error::{Error, Result};
 use crate::sys;
@@ -535,13 +537,7 @@ pub fn add_net_tap(
 ) -> Result<()> {
     let c = CString::new(tap_name)?;
     check("add_net_tap", unsafe {
-        sys::krun_add_net_tap(
-            ctx,
-            c.as_ptr().cast_mut(),
-            mac.as_ptr().cast_mut(),
-            features,
-            flags,
-        )
+        sys::krun_add_net_tap(ctx, c.as_ptr(), mac.as_ptr(), features, flags)
     })
 }
 
@@ -1009,12 +1005,16 @@ pub fn has_feature(feature: Feature) -> Result<bool> {
     Ok(ret == 1)
 }
 
-/// Return the eventfd to signal guest shutdown (libkrun-EFI only).
+/// Return a new eventfd that signals the guest to shut down orderly.
+///
+/// Calling this enables the guest shutdown device for `ctx`, so it must
+/// precede [`start_enter`]. libkrun only provides it on macOS/aarch64.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Krun`] as above.
-pub fn get_shutdown_eventfd(ctx: u32) -> Result<i32> {
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn get_shutdown_eventfd(ctx: u32) -> Result<OwnedFd> {
     let ret = unsafe { sys::krun_get_shutdown_eventfd(ctx) };
     if ret < 0 {
         return Err(Error::Krun {
@@ -1022,7 +1022,8 @@ pub fn get_shutdown_eventfd(ctx: u32) -> Result<i32> {
             code: ret,
         });
     }
-    Ok(ret)
+    // libkrun hands back a fresh `dup` that the caller must close.
+    Ok(unsafe { OwnedFd::from_raw_fd(ret) })
 }
 
 /// Enable or disable split IRQCHIP between host and guest.
@@ -1056,6 +1057,16 @@ mod tests {
         let err = add_virtiofs3(u32::MAX, "vol0", "/tmp", 0, true);
         assert!(
             matches!(&err, Err(Error::Krun { op, code }) if *op == "add_virtiofs3" && *code < 0),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn get_shutdown_eventfd_rejects_unknown_ctx() {
+        let err = get_shutdown_eventfd(u32::MAX);
+        assert!(
+            matches!(&err, Err(Error::Krun { op, code }) if *op == "get_shutdown_eventfd" && *code < 0),
             "{err:?}"
         );
     }

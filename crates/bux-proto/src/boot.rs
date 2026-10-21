@@ -98,7 +98,7 @@ pub struct GuestBootConfig {
 
 /// Make compact JSON survivable as one libkrun cmdline token.
 ///
-/// libkrun v1.19.4 `collapse_str_array` wraps each `KEY=VALUE` in quotes and
+/// libkrun v1.19.6 `collapse_str_array` wraps each `KEY=VALUE` in quotes and
 /// places it on the kernel cmdline. Linux `lib/cmdline.c` `next_arg` toggles
 /// `in_quote` on every `"` and splits on unquoted kernel `isspace`. JSON `"`
 /// therefore leaves PEM `BEGIN CERTIFICATE` unquoted; U+0020 truncates the

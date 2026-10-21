@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Pinned native library versions — keep in sync with `.github/workflows/krun-build.yml`.
-const LIBKRUN_VERSION: &str = "1.19.4";
+const LIBKRUN_VERSION: &str = "1.19.6";
 const LIBKRUNFW_VERSION: &str = "5.5.0";
 
 /// Base URL template for downloading the libkrun header.

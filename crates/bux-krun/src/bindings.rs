@@ -207,8 +207,8 @@ unsafe extern "C" {
     #[doc = " Adds an independent virtio-net device with the tap backend.\n Call to this function disables TSI backend.\n\n The \"krun_add_net_*\" functions can be called multiple times for\n adding multiple virtio-net devices. In the guest the interfaces\n will appear in the same order as they are added (that is, the\n first added interface will be \"eth0\", the second \"eth1\"...)\n\n Arguments:\n  \"ctx_id\"      - the configuration context ID.\n  \"c_tap_name\"  - a null-terminated string representing the tap\n                  device name.\n  \"c_mac\"       - MAC address as an array of 6 uint8_t entries.\n  \"features\"    - virtio-net features for the network interface.\n  \"flags\"       - generic flags for the network interface.\n\n Notes:\n If no network devices are added, networking uses the TSI backend.\n This function should be called before krun_set_port_map.\n\n Returns:\n  Zero on success or a negative error number on failure."]
     pub fn krun_add_net_tap(
         ctx_id: u32,
-        c_tap_name: *mut ::core::ffi::c_char,
-        c_mac: *mut u8,
+        c_tap_name: *const ::core::ffi::c_char,
+        c_mac: *const u8,
         features: u32,
         flags: u32,
     ) -> i32;
@@ -236,6 +236,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Enables and configures a virtio-gpu device. This variant allows specifying\n the size of the host window (acting as vRAM in the guest).\n\n Arguments:\n  \"ctx_id\"      - the configuration context ID.\n  \"virgl_flags\" - flags to pass to virglrenderer.\n  \"shm_size\"    - size of the SHM host window in bytes.\n\n Returns:\n  Zero on success or a negative error number on failure."]
     pub fn krun_set_gpu_options2(ctx_id: u32, virgl_flags: u32, shm_size: u64) -> i32;
+}
+unsafe extern "C" {
+    #[doc = " Sets the file descriptor of the virgl render server to be used instead of having\n libvirglrenderer starting it on its own. This enables the caller to have total control\n over the context where the render server is started.\n\n Arguments:\n  \"ctx_id\"            - the configuration context ID.\n  \"render_server_fd\"  - the file descriptor of the render server.\n\n Returns:\n  Zero on success or a negative error number on failure."]
+    pub fn krun_set_gpu_render_server_fd(ctx_id: u32, render_server_fd: ::core::ffi::c_int) -> i32;
 }
 unsafe extern "C" {
     #[doc = " Configure a display output for the VM.\n\n Note that to have display output a display backend must also be set (see krun_set_display_backend).\n\n Arguments:\n  \"ctx_id\"      - the configuration context ID.\n  \"width\"       - the width of the window/display\n  \"height\"      - the height of the window/display\n\n Returns:\n  The id of the display (0 to KRUN_MAX_DISPLAYS - 1) on success or a negative error number on failure."]
@@ -286,7 +290,7 @@ unsafe extern "C" {
     ) -> ::core::ffi::c_int;
 }
 unsafe extern "C" {
-    #[doc = " Creates a passthrough input device from a host /dev/input/* file descriptor.\n The device configuration will be automatically queried from the host device using ioctls.\n\n Arguments:\n  \"ctx_id\"  - The krun context\n  \"input_fd\" - File descriptor to a /dev/input/* device on the host\n\n Returns:\n  Zero on success or a negative error code otherwise."]
+    #[doc = " Creates a passthrough input device from a host /dev/input/event* file descriptor.\n The device configuration will be automatically queried from the host device using ioctls.\n\n Arguments:\n  \"ctx_id\"  - The krun context\n  \"input_fd\" - File descriptor to a /dev/input/event* device on the host\n\n Returns:\n  Zero on success or a negative error code otherwise."]
     pub fn krun_add_input_device_fd(
         ctx_id: u32,
         input_fd: ::core::ffi::c_int,
@@ -364,7 +368,7 @@ unsafe extern "C" {
     pub fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32;
 }
 unsafe extern "C" {
-    #[doc = " Returns the eventfd file descriptor to signal the guest to shut down orderly. This must be\n called before starting the microVM with \"krun_start_event\". Only available in libkrun-efi.\n\n Arguments:\n  \"ctx_id\"    - the configuration context ID.\n\n Returns:\n  The eventfd file descriptor or a negative error number on failure."]
+    #[doc = " Returns the eventfd file descriptor to signal the guest to shut down orderly. Calling this\n function enables the guest shutdown device for the context. This must be called before starting\n the microVM with \"krun_start_enter\". Only available on macOS/aarch64.\n\n Arguments:\n  \"ctx_id\"    - the configuration context ID.\n\n Returns:\n  A new eventfd file descriptor owned by the caller, which must be closed, or a negative error\n  number on failure."]
     pub fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32;
 }
 unsafe extern "C" {

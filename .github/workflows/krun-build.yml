@@ -12,7 +12,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # Pin native library versions — keep in sync with crates/bux-krun/build.rs.
-  LIBKRUN_VERSION: "1.19.4"
+  LIBKRUN_VERSION: "1.19.6"
   LIBKRUNFW_VERSION: "5.5.0"
 
 jobs:
