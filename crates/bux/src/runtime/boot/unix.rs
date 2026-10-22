@@ -1,14 +1,10 @@
-//! Unix sockets, shim PID, and virtio-net JSON.
+//! Unix sockets, shim diagnostics, and virtio-net JSON.
 
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::Duration;
 
 use bux_shim::{ShimGvproxy, ShimNetConn, ShimNetwork};
-use nix::sys::signal;
-use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::Pid;
 
 use crate::Result;
 use crate::ports::{format_port_pairs, parse_publish_spec, resolve_ports};
@@ -45,7 +41,7 @@ pub(crate) fn stderr_tail(path: &Path, last_n_lines: usize) -> String {
 }
 
 /// Builds a diagnostic message when the shim dies before the guest agent is ready.
-pub(crate) fn shim_death_message(pid: i32, exit_file: &Path) -> String {
+pub(crate) fn shim_death_message(pid: u32, exit_file: &Path) -> String {
     let detail = bux_shim::ExitInfo::from_file(exit_file)
         .map_or_else(|| "unknown reason".into(), |info| info.summary());
     let hint = stderr_tail(&exit_file.with_extension("stderr"), 5);
@@ -53,7 +49,7 @@ pub(crate) fn shim_death_message(pid: i32, exit_file: &Path) -> String {
 }
 
 /// Timeout path: ready wait expired while the jail parent is still alive.
-pub(crate) fn agent_not_ready_message(pid: i32, exit_file: &Path) -> String {
+pub(crate) fn agent_not_ready_message(pid: u32, exit_file: &Path) -> String {
     let hint = stderr_tail(&exit_file.with_extension("stderr"), 5);
     format!("guest agent did not become ready (pid {pid}){hint}")
 }
@@ -97,26 +93,6 @@ pub(crate) fn clean_unready_files(socket: &Path) {
 /// `{id}.sock` → `{id}.net.sock`.
 pub(crate) fn clean_net_sock(socket: &Path) {
     drop(fs::remove_file(socket.with_extension("net.sock")));
-}
-
-/// Checks if a process is alive via `kill(pid, 0)`.
-pub(crate) fn is_pid_alive(pid: i32) -> bool {
-    signal::kill(Pid::from_raw(pid), None).is_ok()
-}
-
-/// Blocks until a process exits.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "sync fallback poll cannot use tokio::time::sleep"
-)]
-pub(crate) fn wait_for_exit(pid: i32) {
-    let nix_pid = Pid::from_raw(pid);
-    if let Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) = waitpid(nix_pid, None) {
-        return;
-    }
-    while is_pid_alive(pid) {
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 /// Build virtio-net JSON for the shim binary. Both `Some` or both `None`.

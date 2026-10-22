@@ -244,14 +244,14 @@ mod tests {
 
     fn plant_vm(data_dir: &Path, id: &str, config: &serde_json::Value) {
         let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
+        let pid = child.id();
         drop(child.wait());
         let socket = data_dir.join("socks").join(format!("{id}.sock"));
         let conn = rusqlite::Connection::open(data_dir.join("bux.db")).unwrap();
         conn.busy_timeout(Duration::from_secs(5)).unwrap();
         conn.execute(
-            "INSERT INTO vms (id, name, pid, image, socket, status, config, created_at)
-             VALUES (?1, ?2, ?3, NULL, ?4, 'stopped', ?5, 0)",
+            "INSERT INTO vms (id, name, pid, start_time, image, socket, status, config, created_at)
+             VALUES (?1, ?2, ?3, 0, NULL, ?4, 'stopped', ?5, 0)",
             params![
                 id,
                 "a-tenant1-a1",

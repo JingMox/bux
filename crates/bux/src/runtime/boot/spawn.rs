@@ -1,16 +1,13 @@
 //! Overlay, secrets, jail spawn, and VM row insert.
 
 use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use bux_jail::JailConfig;
+use bux_jail::{JailConfig, Keepalive, ShimProcess};
 use bux_proto::AGENT_PORT;
 use bux_shim::{ShimConfig, ShimDiskFormat, ShimGvproxy, ShimNetwork, ShimVirtioFs, ShimVsockPort};
-use nix::sys::signal;
-use nix::unistd::Pid;
 use tracing::info;
 
 use super::super::{Runtime, Vm};
@@ -22,7 +19,6 @@ use crate::Result;
 use crate::disk::DiskFormat;
 use crate::secrets::{LiveSecrets, Secret};
 use crate::state::{self, Status, VmConfig, VmState, VsockPort};
-use crate::watchdog::{self, Keepalive};
 
 /// Tears down overlay / secrets / shim / row if spawn fails after overlay.
 struct SpawnAbort<'a> {
@@ -32,8 +28,8 @@ struct SpawnAbort<'a> {
     id: String,
     /// Vsock socket path (also locates json/stderr/exit files).
     socket: PathBuf,
-    /// Shim PID once spawned (`None` until jail spawn succeeds).
-    pid: Option<i32>,
+    /// Shim process once spawned (`None` until jail spawn succeeds).
+    process: Option<ShimProcess>,
     /// When true, `Drop` runs abort cleanup.
     armed: bool,
 }
@@ -50,14 +46,14 @@ impl Drop for SpawnAbort<'_> {
         if !self.armed {
             return;
         }
-        abort_partial_spawn(self.rt, &self.id, &self.socket, self.pid);
+        abort_partial_spawn(self.rt, &self.id, &self.socket, self.process);
     }
 }
 
-/// SIGKILL if spawned, then secrets/overlay/volumes/row.
-fn abort_partial_spawn(rt: &Runtime, id: &str, socket: &Path, pid: Option<i32>) {
-    if let Some(pid) = pid {
-        signal::kill(Pid::from_raw(pid), signal::Signal::SIGKILL).ok();
+/// Kill the shim if spawned, then secrets/overlay/volumes/row.
+fn abort_partial_spawn(rt: &Runtime, id: &str, socket: &Path, process: Option<ShimProcess>) {
+    if let Some(process) = process {
+        process.kill().ok();
     }
     rt.secrets
         .lock()
@@ -71,9 +67,9 @@ fn abort_partial_spawn(rt: &Runtime, id: &str, socket: &Path, pid: Option<i32>) 
 
 /// Result of spawning a shim subprocess.
 pub(crate) struct ShimSpawnResult {
-    /// Child PID (as i32 for nix compatibility).
-    pub pid: i32,
-    /// Parent-side watchdog keepalive.
+    /// The spawned shim (or its jail parent).
+    pub process: ShimProcess,
+    /// Parent-side watchdog keepalive (`None` when detached).
     pub keepalive: Option<Keepalive>,
     /// Actual security posture from the jail spawn.
     pub security: crate::security::SecurityStatus,
@@ -131,7 +127,7 @@ pub(crate) fn spawn_config(
         rt,
         id: id.clone(),
         socket: socket.clone(),
-        pid: None,
+        process: None,
         armed: true,
     };
 
@@ -174,14 +170,15 @@ pub(crate) fn spawn_config(
         shim_override,
         bwrap,
     )?;
-    abort.pid = Some(shim.pid);
+    abort.process = Some(shim.process);
 
     config.security_status = shim.security.clone();
 
     let vm_state = VmState {
         id: id.clone(),
         name,
-        pid: shim.pid,
+        pid: shim.process.pid(),
+        start_time: shim.process.start_time(),
         image,
         socket,
         status: Status::Running,
@@ -193,7 +190,7 @@ pub(crate) fn spawn_config(
 
     info!(
         vm_id = %id,
-        pid = shim.pid,
+        pid = shim.process.pid(),
         network_enabled = vm_state.config.network.is_enabled(),
         "VM spawned"
     );
@@ -264,16 +261,10 @@ fn to_shim_config(
     }
 }
 
-/// Watchdog, PDEATHSIG, and bwrap `--die-with-parent` follow persisted detach.
+/// Keepalive pipe, PDEATHSIG, and bwrap `--die-with-parent` follow persisted detach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "independent spawn flags, not a state machine"
-)]
 pub(super) struct SpawnPolicy {
-    /// Parent keepalive pipe.
-    pub watch_parent: bool,
-    /// `PR_SET_PDEATHSIG` and bwrap `--die-with-parent`.
+    /// Keepalive pipe, `PR_SET_PDEATHSIG`, and bwrap `--die-with-parent`.
     pub die_with_parent: bool,
     /// Seatbelt host net / Landlock `AccessNet`.
     pub network_host: bool,
@@ -283,13 +274,12 @@ pub(super) struct SpawnPolicy {
 #[must_use]
 pub(super) const fn spawn_policy(config: &VmConfig) -> SpawnPolicy {
     SpawnPolicy {
-        watch_parent: !config.detach,
         die_with_parent: !config.detach,
         network_host: config.network.is_enabled(),
     }
 }
 
-/// Writes config JSON (mode 0o600), creates watchdog pipe, and spawns `bux-shim`.
+/// Writes config JSON (mode 0o600) and spawns `bux-shim` (with a keepalive unless detached).
 ///
 /// `network` / `gvproxy` are both `Some` (virtio-net) or both `None` (offline).
 /// `bwrap_path` is required on Linux when `config.security.jailer` is true.
@@ -331,12 +321,6 @@ pub(crate) fn spawn_shim(
     let stderr_path = config_path.with_extension("stderr");
     let stderr_file = fs::File::create(&stderr_path)?;
 
-    let (shim_wd_fd, keepalive) = if policy.watch_parent {
-        let (fd, keepalive) = watchdog::create()?;
-        (Some(fd), Some(keepalive))
-    } else {
-        (None, None)
-    };
     let shim = find_shim(shim_path)?;
 
     let readonly_paths = config
@@ -369,7 +353,6 @@ pub(crate) fn spawn_shim(
             .iter()
             .map(|v| PathBuf::from(&v.path))
             .collect(),
-        watchdog_fd: shim_wd_fd.as_ref().map(AsRawFd::as_raw_fd),
         sandbox,
         stderr_file: Some(stderr_file),
         landlock: sec.landlock,
@@ -382,17 +365,10 @@ pub(crate) fn spawn_shim(
     let result =
         bux_jail::spawn(&shim, config_path, jail_config).map_err(|e| map_jail_error(e, &shim))?;
 
-    #[allow(
-        clippy::cast_possible_wrap,
-        reason = "PID fits in i32 on all supported platforms"
-    )]
-    let pid = result.child.id() as i32;
-    drop(shim_wd_fd);
-
     unlink_json.keep = true;
     Ok(ShimSpawnResult {
-        pid,
-        keepalive,
+        process: result.process,
+        keepalive: result.keepalive,
         security: crate::security::SecurityStatus::from_report(&result.security),
     })
 }
@@ -528,7 +504,6 @@ mod tests {
         let cfg = super::super::config_from_options(&opts, None, None, vec![]);
         assert!(cfg.detach);
         let policy = spawn_policy(&cfg);
-        assert!(!policy.watch_parent);
         assert!(!policy.die_with_parent);
         assert!(policy.network_host);
     }
@@ -541,7 +516,6 @@ mod tests {
             ..VmConfig::default()
         };
         let policy = spawn_policy(&cfg);
-        assert!(!policy.watch_parent);
         assert!(!policy.die_with_parent);
         assert!(!policy.network_host);
     }

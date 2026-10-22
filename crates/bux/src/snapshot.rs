@@ -218,6 +218,7 @@ mod tests {
             id: "vm1".into(),
             name: None,
             pid: 1,
+            start_time: 0,
             image: None,
             socket: sock.clone(),
             status: Status::Running,

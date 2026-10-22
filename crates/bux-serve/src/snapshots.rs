@@ -392,15 +392,15 @@ mod tests {
         data_dir: &Path,
         id: &str,
         name: &str,
-        pid: i32,
+        pid: u32,
         status: &str,
         config: &serde_json::Value,
     ) {
         let socket = data_dir.join("socks").join(format!("{id}.sock"));
         open_db(data_dir)
             .execute(
-                "INSERT INTO vms (id, name, pid, image, socket, status, config, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                "INSERT INTO vms (id, name, pid, start_time, image, socket, status, config, created_at)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, 0)",
                 params![
                     id,
                     name,
@@ -440,9 +440,9 @@ mod tests {
         })
     }
 
-    fn dead_pid() -> i32 {
+    fn dead_pid() -> u32 {
         let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
+        let pid = child.id();
         drop(child.wait());
         pid
     }

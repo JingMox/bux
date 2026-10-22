@@ -17,7 +17,8 @@ use crate::error::{Error, Result};
 /// path — callers must wipe the data directory.
 ///
 /// v5: drop `vms.health`.
-pub(crate) const PRODUCT_SCHEMA_VERSION: u32 = 5;
+/// v6: add `vms.start_time` (shim process start time, guards PID reuse).
+pub(crate) const PRODUCT_SCHEMA_VERSION: u32 = 6;
 
 /// DDL for a fresh product database.
 const PRODUCT_SCHEMA_SQL: &str = "
@@ -25,6 +26,7 @@ CREATE TABLE vms (
     id          TEXT PRIMARY KEY NOT NULL,
     name        TEXT UNIQUE,
     pid         INTEGER NOT NULL,
+    start_time  INTEGER NOT NULL,
     image       TEXT,
     socket      TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'running',
@@ -156,12 +158,13 @@ impl StateDb {
         let config_json = serde_json::to_string(&s.config)?;
         let ts = system_time_to_f64(s.created_at);
         self.lock().execute(
-            "INSERT INTO vms (id, name, pid, image, socket, status, config, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO vms (id, name, pid, start_time, image, socket, status, config, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 s.id,
                 s.name,
                 s.pid,
+                s.start_time.cast_signed(),
                 s.image,
                 s.socket.to_string_lossy(),
                 status_str(s.status),
@@ -185,15 +188,21 @@ impl StateDb {
         Ok(())
     }
 
-    /// Persist shim PID and status together (restart must not leave the old PID).
+    /// Persist the shim process and status together (restart must not leave the old process).
     ///
     /// # Errors
     ///
     /// Returns an error if the database update fails.
-    pub(crate) fn update_pid_status(&self, id: &str, pid: i32, status: Status) -> Result<()> {
+    pub(crate) fn update_process_status(
+        &self,
+        id: &str,
+        pid: u32,
+        start_time: u64,
+        status: Status,
+    ) -> Result<()> {
         self.lock().execute(
-            "UPDATE vms SET pid = ?1, status = ?2 WHERE id = ?3",
-            params![pid, status_str(status), id],
+            "UPDATE vms SET pid = ?1, start_time = ?2, status = ?3 WHERE id = ?4",
+            params![pid, start_time.cast_signed(), status_str(status), id],
         )?;
         Ok(())
     }
@@ -647,11 +656,12 @@ fn row_to_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<VmState> {
         id: row.get("id")?,
         name: row.get("name")?,
         pid: row.get("pid")?,
+        start_time: row.get::<_, i64>("start_time")?.cast_unsigned(),
         image: row.get("image")?,
         socket: socket_str.into(),
         status: parse_status(&status_text),
         config: serde_json::from_str(&config_json).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
         })?,
         created_at: f64_to_system_time(ts),
     })
@@ -726,7 +736,7 @@ mod tests {
     )]
     fn product_schema_version() {
         let db = StateDb::open(":memory:").expect("open in-memory db");
-        assert_eq!(PRODUCT_SCHEMA_VERSION, 5);
+        assert_eq!(PRODUCT_SCHEMA_VERSION, 6);
 
         let mut names = Vec::new();
         {
@@ -734,7 +744,7 @@ mod tests {
             let version: u32 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 5);
+            assert_eq!(version, 6);
 
             let mut stmt = conn.prepare("PRAGMA table_info(vms)").unwrap();
             let mut rows = stmt.query([]).unwrap();
@@ -745,6 +755,10 @@ mod tests {
         assert!(
             !names.iter().any(|n| n == "health"),
             "vms must not have a health column, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "start_time"),
+            "vms must record the shim start time, got {names:?}"
         );
     }
 }

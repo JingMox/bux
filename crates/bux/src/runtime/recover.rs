@@ -5,22 +5,21 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
+use bux_jail::ShimProcess;
 use tracing::{info, warn};
 
 use super::Runtime;
-use super::boot::{clean_vm_files, is_pid_alive};
+use super::boot::clean_vm_files;
 use crate::lifecycle::{self, RecoverAction};
 use crate::state::{Status, VmState};
 
 impl Runtime {
     /// Gracefully stops all active non-detached VMs.
     ///
-    /// Sends `SIGTERM` to each shim process, waits briefly, then
-    /// `SIGKILL` any survivors. Called automatically when the
-    /// `Runtime` is dropped, or can be called manually for
-    /// coordinated shutdown. Detached rows are left running.
+    /// Asks each shim process to exit, waits briefly, then kills any
+    /// survivors. Called automatically when the `Runtime` is dropped, or
+    /// can be called manually for coordinated shutdown. Detached rows are
+    /// left running.
     #[allow(
         clippy::disallowed_methods,
         reason = "sync shutdown cannot use tokio::time::sleep"
@@ -31,12 +30,12 @@ impl Runtime {
         };
 
         for vm in vms {
-            if !vm.status.is_active() || !is_pid_alive(vm.pid) || vm.config.detach {
+            if !vm.status.is_active() || !vm.process().is_alive() || vm.config.detach {
                 continue;
             }
 
             info!(vm_id = %vm.id, pid = vm.pid, "stopping VM on shutdown");
-            terminate_pid(vm.pid, &vm.id);
+            terminate(vm.process(), &vm.id);
             drop(self.db.update_status(&vm.id, Status::Stopped));
         }
     }
@@ -45,8 +44,9 @@ impl Runtime {
     ///
     /// Phases:
     /// 1. Auto-remove stopped VMs flagged with `auto_remove`.
-    /// 2. For active rows: dead PID → Stopped; live PID → vsock-only
-    ///    (the shim owns gvproxy and secrets; do not SIGTERM).
+    /// 2. For active rows: dead shim (or its PID now held by another
+    ///    process) → Stopped; live shim → vsock-only (the shim owns
+    ///    gvproxy and secrets; do not SIGTERM).
     /// 3. Clean up orphaned socket files.
     pub(super) fn recover(&self) {
         let vms = match self.db.list() {
@@ -85,7 +85,7 @@ impl Runtime {
             return 0;
         }
 
-        match lifecycle::recover_action(is_pid_alive(vm.pid)) {
+        match lifecycle::recover_action(vm.process().is_alive()) {
             RecoverAction::MarkDeadStopped => self.recover_dead(vm),
             RecoverAction::ReattachVsockOnly => {
                 info!(vm_id = %vm.id, "recovery: live shim (vsock reattach; net stays in-process)");
@@ -142,9 +142,7 @@ impl Runtime {
 
         if vm.status.is_active() && expired(vm.config.auto_stop_secs, vm.config.last_activity_at) {
             info!(vm_id = %vm.id, "sweep: auto-stop idle VM");
-            if is_pid_alive(vm.pid) {
-                terminate_pid(vm.pid, &vm.id);
-            }
+            terminate(vm.process(), &vm.id);
             drop(self.db.update_status(&vm.id, Status::Stopped));
             clean_vm_files(&vm.socket);
             let mut cfg = vm.config.clone();
@@ -171,21 +169,28 @@ impl Runtime {
     }
 }
 
-/// SIGTERM then optional SIGKILL for a shim PID.
+/// Terminate a shim, then kill it if it is still alive after 5 s.
 #[allow(
     clippy::disallowed_methods,
     reason = "sync recovery cannot use tokio::time::sleep"
 )]
-fn terminate_pid(pid: i32, vm_id: &str) {
-    signal::kill(Pid::from_raw(pid), Signal::SIGTERM).ok();
+fn terminate(process: ShimProcess, vm_id: &str) {
+    if !process.is_alive() {
+        return;
+    }
+    process.terminate().ok();
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(5);
-    while is_pid_alive(pid) && start.elapsed() < timeout {
+    while process.is_alive() && start.elapsed() < timeout {
         std::thread::sleep(Duration::from_millis(50));
     }
-    if is_pid_alive(pid) {
-        warn!(vm_id, pid, "SIGKILL after recovery/stop timeout");
-        signal::kill(Pid::from_raw(pid), Signal::SIGKILL).ok();
+    if process.is_alive() {
+        warn!(
+            vm_id,
+            pid = process.pid(),
+            "kill after recovery/stop timeout"
+        );
+        process.kill().ok();
     }
 }
 

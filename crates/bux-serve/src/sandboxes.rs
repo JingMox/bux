@@ -611,20 +611,24 @@ mod tests {
         data_dir: &Path,
         id: &str,
         name: &str,
-        pid: i32,
+        pid: u32,
         status: &str,
         image: Option<&str>,
         config: &serde_json::Value,
     ) {
         let socket = data_dir.join("socks").join(format!("{id}.sock"));
+        // A live pid needs its real start time to count as running.
+        let start_time =
+            bux_jail::ShimProcess::from_pid(pid).map_or(0, bux_jail::ShimProcess::start_time);
         open_db(data_dir)
             .execute(
-                "INSERT INTO vms (id, name, pid, image, socket, status, config, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)",
+                "INSERT INTO vms (id, name, pid, start_time, image, socket, status, config, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
                 params![
                     id,
                     name,
                     pid,
+                    start_time.cast_signed(),
                     image,
                     socket.to_str().expect("socket utf-8"),
                     status,
@@ -652,9 +656,9 @@ mod tests {
         })
     }
 
-    fn dead_pid() -> i32 {
+    fn dead_pid() -> u32 {
         let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
+        let pid = child.id();
         drop(child.wait());
         pid
     }
@@ -988,7 +992,7 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
+        let pid = child.id();
         let h = harness(Limits {
             max_running_ram_mib: 1000,
             ..Limits::default()
@@ -1102,7 +1106,7 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
+        let pid = child.id();
         let h = harness(Limits::default());
         let image = alpine_image();
         plant_vm(
@@ -1557,7 +1561,7 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
+        let pid = child.id();
         let h = harness(Limits::default());
         let image = bux::canonical_reference("python:slim").unwrap();
         plant_vm(
@@ -1597,7 +1601,7 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
+        let pid = child.id();
         let h = harness(Limits::default());
         let image = alpine_image();
         let mut config = owned_config("tenant1", "a1");
@@ -1634,7 +1638,7 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
+        let pid = child.id();
         let h = harness_cfg(Limits::default(), true);
         let image = alpine_image();
         let mut config = owned_config("tenant1", "a1");
@@ -1671,7 +1675,7 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
+        let pid = child.id();
         let h = harness(Limits::default());
         let image = alpine_image();
         plant_vm(
@@ -1772,7 +1776,7 @@ mod tests {
             .arg("60")
             .spawn()
             .unwrap();
-        let pid = i32::try_from(child.id()).unwrap();
+        let pid = child.id();
         let h = harness(Limits::default());
         plant_vm(
             h.dir.path(),

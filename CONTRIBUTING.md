@@ -101,7 +101,7 @@ bux system info --format json
 - Engine boundary: product `VmConfig` → `ShimConfig` → `bux-shim` → libkrun.
 - Managed network: gvproxy virtio-net in the `bux-shim` process (`bux-shim-bin`); no TSI `set_port_map`.
 - Guest agent: postcard protocol v10; Phase A process identity only.
-- Schema: SQLite `user_version` 5 — **no migrations**; wipe `BUX_HOME` on mismatch.
+- Schema: SQLite `user_version` 6 — **no migrations**; wipe `BUX_HOME` on mismatch.
 - Isolation vs host: hardware VM. Isolation vs other agents: one VM per agent.
 - `create` fail-closed: `require_virtualization` before image resolve
   (`Error::SecurityUnavailable`; HTTP 412).
