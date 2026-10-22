@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "bux-guest"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bux-proto",
  "futures",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "bux-krun"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bindgen",
  "flate2",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "bux-shim"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bux-krun",
  "bux-seccomp",

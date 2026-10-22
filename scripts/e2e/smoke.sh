@@ -44,7 +44,6 @@ fi
 echo "==> system info"
 bux system info
 info_json="$(bux system info --format json)"
-echo "${info_json}" | grep -q '"krun_features"'
 echo "${info_json}" | grep -q '"isolation_warnings"'
 echo "${info_json}" | grep -q '"virtualization"'
 

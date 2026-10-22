@@ -612,20 +612,6 @@ fn system_info(format: OutputFormat) -> Result<()> {
 
     println!("data dir:     {}", data_dir.display());
     println!("payload dir:  {}", payload_dir.display());
-    if let Some(n) = host.max_vcpus {
-        println!("max vCPUs:    {n}");
-    }
-    let label = if host.krun_features.is_empty() {
-        "none".to_owned()
-    } else {
-        host.krun_features.join(", ")
-    };
-    println!("libkrun:      {label}");
-    match host.nested_virt {
-        Some(true) => println!("nested virt:  supported"),
-        Some(false) => println!("nested virt:  not supported"),
-        None => {}
-    }
     println!("virtualization: {}", yn(host.virtualization));
     println!("namespaces:     {} (bwrap)", yn(host.namespaces));
     println!("landlock:       {}", yn(host.landlock));
