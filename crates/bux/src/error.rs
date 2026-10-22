@@ -61,11 +61,6 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    /// Unix syscall error (via nix).
-    #[cfg(unix)]
-    #[error(transparent)]
-    Nix(#[from] nix::errno::Errno),
-
     /// Ext4 filesystem image creation error.
     #[cfg(unix)]
     #[error(transparent)]

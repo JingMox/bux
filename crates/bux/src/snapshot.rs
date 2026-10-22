@@ -176,9 +176,10 @@ mod tests {
     use bux_proto::{ControlReq, ControlResp, ErrorInfo, Hello, HelloAck, PROTOCOL_VERSION};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::SystemTime;
-    use tokio::net::UnixListener;
 
-    async fn stub_guest_quiesce_error(listener: UnixListener, saw_quiesce: Arc<AtomicBool>) {
+    use crate::transport::{self, Listener};
+
+    async fn stub_guest_quiesce_error(listener: Listener, saw_quiesce: Arc<AtomicBool>) {
         let (mut stream, _) = listener.accept().await.unwrap();
         let hello: Hello = bux_proto::recv(&mut stream).await.unwrap();
         assert!(
@@ -235,7 +236,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let listener = UnixListener::bind(&sock).unwrap();
+                let listener = transport::listen(&sock).unwrap();
                 let saw = Arc::clone(&saw_quiesce);
                 let server = tokio::spawn(stub_guest_quiesce_error(listener, saw));
                 let client = Client::new(&sock);

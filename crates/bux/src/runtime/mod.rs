@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{fs, io};
 
-use nix::fcntl::{Flock, FlockArg};
 use tracing::info;
 
 use crate::Result;
@@ -105,8 +104,8 @@ pub struct Runtime {
     disk: DiskManager,
     /// OCI image manager.
     oci: bux_oci::Oci,
-    /// Advisory lock — held for the lifetime of this `Runtime`.
-    _lock: Flock<fs::File>,
+    /// `bux.lock`, exclusively locked for the lifetime of this `Runtime`.
+    _lock: fs::File,
     /// Snapshot manager.
     snapshots: SnapshotManager,
     /// Memory-only secrets per VM (never `SQLite`).
@@ -167,10 +166,7 @@ impl Runtime {
         let base = opts.data_dir.as_path();
         fs::create_dir_all(base)?;
 
-        let lock_file = fs::File::create(base.join("bux.lock"))?;
-        let lock = Flock::lock(lock_file, FlockArg::LockExclusiveNonblock).map_err(|_| {
-            crate::Error::Busy(format!("another bux runtime is using {}", base.display()))
-        })?;
+        let lock = lock_data_dir(base)?;
 
         let socks_dir = base.join("socks");
         fs::create_dir_all(&socks_dir)?;
@@ -309,10 +305,7 @@ impl Runtime {
             return Ok(());
         }
         fs::create_dir_all(base)?;
-        let lock_file = fs::File::create(base.join("bux.lock"))?;
-        let _lock = Flock::lock(lock_file, FlockArg::LockExclusiveNonblock).map_err(|_| {
-            crate::Error::Busy(format!("another bux runtime is using {}", base.display()))
-        })?;
+        let _lock = lock_data_dir(base)?;
         fs::remove_dir_all(base)?;
         Ok(())
     }
@@ -683,6 +676,21 @@ impl Runtime {
             drop(self.db.update_status(&vm.id, Status::Stopped));
             clean_vm_files(&vm.socket);
         }
+    }
+}
+
+/// Take the exclusive `bux.lock` in `base` without blocking.
+///
+/// Returns [`crate::Error::Busy`] when another runtime holds it.
+fn lock_data_dir(base: &Path) -> Result<fs::File> {
+    let file = fs::File::create(base.join("bux.lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(crate::Error::Busy(format!(
+            "another bux runtime is using {}",
+            base.display()
+        ))),
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
     }
 }
 
