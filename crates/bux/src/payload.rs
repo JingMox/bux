@@ -14,7 +14,6 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
-use nix::fcntl::{Flock, FlockArg};
 use sha2::{Digest, Sha256};
 use tracing::{error, info};
 
@@ -374,12 +373,13 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn lock_payload_root() -> Result<Flock<File>> {
+fn lock_payload_root() -> Result<File> {
     let root = payload_root();
     fs::create_dir_all(&root)?;
     chmod_0700(&root)?;
     let file = File::create(root.join(".lock"))?;
-    Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, err)| Error::from(err))
+    file.lock()?;
+    Ok(file)
 }
 
 fn chmod_0700(path: &Path) -> io::Result<()> {

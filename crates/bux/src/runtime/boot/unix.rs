@@ -11,8 +11,12 @@ use crate::ports::{format_port_pairs, parse_publish_spec, resolve_ports};
 use crate::secrets::LiveSecrets;
 use crate::state::VmConfig;
 
-/// macOS pathname `sun_path` is 104 bytes (trailing NUL); Linux is 108.
+/// Size of `sockaddr_un.sun_path`, including the trailing NUL.
+#[cfg(target_os = "macos")]
 const MAX_SUN_PATH: usize = 104;
+/// Size of `sockaddr_un.sun_path`, including the trailing NUL.
+#[cfg(not(target_os = "macos"))]
+const MAX_SUN_PATH: usize = 108;
 
 /// Fail closed when a unix socket path cannot fit in `sockaddr_un.sun_path`.
 pub(super) fn reject_long_unix_path(path: &Path) -> Result<()> {
@@ -148,9 +152,9 @@ mod tests {
 
     #[test]
     fn reject_long_unix_path_threshold() {
-        let ok = PathBuf::from("a".repeat(103));
+        let ok = PathBuf::from("a".repeat(MAX_SUN_PATH - 1));
         assert!(reject_long_unix_path(&ok).is_ok());
-        let err = reject_long_unix_path(&PathBuf::from("a".repeat(104))).unwrap_err();
+        let err = reject_long_unix_path(&PathBuf::from("a".repeat(MAX_SUN_PATH))).unwrap_err();
         assert!(matches!(err, crate::Error::InvalidConfig(_)));
         assert!(err.to_string().contains("sun_path"));
     }

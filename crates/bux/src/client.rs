@@ -12,7 +12,8 @@ use bux_proto::{
     UploadResult,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf, WriteHalf};
-use tokio::net::UnixStream;
+
+use crate::transport::{self, Stream};
 
 /// Output captured from a completed exec.
 #[derive(Debug)]
@@ -59,12 +60,12 @@ pub struct ExecHandle {
     /// Child process ID inside the guest.
     pid: i32,
     /// Read half — receives [`ExecOut`] messages from the guest.
-    reader: ReadHalf<UnixStream>,
+    reader: ReadHalf<Stream>,
     /// Write half — sends [`ExecIn`] messages to the guest. Unlike
     /// `OwnedWriteHalf`, dropping it does not shut the socket down: the
     /// guest kills the job on EOF, so the connection must stay open until
     /// both halves are gone (#197).
-    writer: WriteHalf<UnixStream>,
+    writer: WriteHalf<Stream>,
 }
 
 impl ExecHandle {
@@ -75,7 +76,7 @@ impl ExecHandle {
     async fn collect_output(
         exec_id: String,
         pid: i32,
-        reader: &mut ReadHalf<UnixStream>,
+        reader: &mut ReadHalf<Stream>,
         mut on: impl FnMut(&ExecOut),
     ) -> io::Result<ExecOutput> {
         let mut stdout = Vec::new();
@@ -579,13 +580,13 @@ impl Client {
         bux_proto::recv_download(&mut stream, writer, max_bytes).await
     }
 
-    /// Opens a raw Unix socket connection to the guest agent.
-    async fn connect_raw(&self) -> io::Result<UnixStream> {
-        UnixStream::connect(&self.socket_path).await
+    /// Opens a raw connection to the guest agent.
+    async fn connect_raw(&self) -> io::Result<Stream> {
+        transport::connect(&self.socket_path).await
     }
 
     /// Opens a control connection (`Hello::Control` + `HelloAck::Control`).
-    async fn open_control(&self) -> io::Result<UnixStream> {
+    async fn open_control(&self) -> io::Result<Stream> {
         let mut stream = self.connect_raw().await?;
         bux_proto::send(
             &mut stream,
@@ -644,14 +645,13 @@ mod tests {
     use std::time::Duration;
 
     use bux_proto::ExecIn;
-    use tokio::net::UnixListener;
 
     use super::*;
 
     /// Guest stub for one exec. The real agent kills the job when the host
     /// side of the connection reaches EOF, so after `StdinClose` the
     /// connection must stay open until the guest reports `Exit`.
-    async fn stub_guest_exec(listener: UnixListener) -> Vec<u8> {
+    async fn stub_guest_exec(listener: transport::Listener) -> Vec<u8> {
         let (mut stream, _) = listener.accept().await.unwrap();
         let hello: Hello = bux_proto::recv(&mut stream).await.unwrap();
         assert!(matches!(hello, Hello::Exec(_)), "{hello:?}");
@@ -700,7 +700,7 @@ mod tests {
     async fn stdin_eof_keeps_exec_connection_open() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("g.sock");
-        let guest = tokio::spawn(stub_guest_exec(UnixListener::bind(&sock).unwrap()));
+        let guest = tokio::spawn(stub_guest_exec(transport::listen(&sock).unwrap()));
 
         let handle = Client::new(&sock)
             .exec(ExecStart::new("cat").with_stdin())

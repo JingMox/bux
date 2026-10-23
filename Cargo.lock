@@ -289,7 +289,6 @@ dependencies = [
  "bux-shim",
  "dirs",
  "flate2",
- "nix 0.31.3",
  "rcgen",
  "rusqlite",
  "serde",
