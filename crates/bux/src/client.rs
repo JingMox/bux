@@ -11,9 +11,8 @@ use bux_proto::{
     ControlReq, ControlResp, ExecIn, ExecOut, ExecStart, Hello, HelloAck, PROTOCOL_VERSION,
     UploadResult,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::UnixStream;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 /// Output captured from a completed exec.
 #[derive(Debug)]
@@ -60,9 +59,12 @@ pub struct ExecHandle {
     /// Child process ID inside the guest.
     pid: i32,
     /// Read half — receives [`ExecOut`] messages from the guest.
-    reader: OwnedReadHalf,
-    /// Write half — sends [`ExecIn`] messages to the guest.
-    writer: OwnedWriteHalf,
+    reader: ReadHalf<UnixStream>,
+    /// Write half — sends [`ExecIn`] messages to the guest. Unlike
+    /// `OwnedWriteHalf`, dropping it does not shut the socket down: the
+    /// guest kills the job on EOF, so the connection must stay open until
+    /// both halves are gone (#197).
+    writer: WriteHalf<UnixStream>,
 }
 
 impl ExecHandle {
@@ -73,7 +75,7 @@ impl ExecHandle {
     async fn collect_output(
         exec_id: String,
         pid: i32,
-        reader: &mut OwnedReadHalf,
+        reader: &mut ReadHalf<UnixStream>,
         mut on: impl FnMut(&ExecOut),
     ) -> io::Result<ExecOutput> {
         let mut stdout = Vec::new();
@@ -404,7 +406,7 @@ impl Client {
         bux_proto::send(&mut stream, &Hello::Exec(req)).await?;
         match bux_proto::recv::<HelloAck>(&mut stream).await? {
             HelloAck::ExecStarted { exec_id, pid } => {
-                let (reader, writer) = stream.into_split();
+                let (reader, writer) = tokio::io::split(stream);
                 Ok(ExecHandle {
                     exec_id,
                     pid,
@@ -629,5 +631,88 @@ impl Client {
             UploadResult::Error(e) => Err(io::Error::other(e)),
             _ => Err(io::Error::other("unexpected upload result")),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::missing_docs_in_private_items,
+    reason = "tests"
+)]
+mod tests {
+    use std::time::Duration;
+
+    use bux_proto::ExecIn;
+    use tokio::net::UnixListener;
+
+    use super::*;
+
+    /// Guest stub for one exec. The real agent kills the job when the host
+    /// side of the connection reaches EOF, so after `StdinClose` the
+    /// connection must stay open until the guest reports `Exit`.
+    async fn stub_guest_exec(listener: UnixListener) -> Vec<u8> {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let hello: Hello = bux_proto::recv(&mut stream).await.unwrap();
+        assert!(matches!(hello, Hello::Exec(_)), "{hello:?}");
+        let started = HelloAck::ExecStarted {
+            exec_id: "e1".into(),
+            pid: 7,
+        };
+        bux_proto::send(&mut stream, &started).await.unwrap();
+
+        let mut stdin = Vec::new();
+        loop {
+            let msg = bux_proto::recv::<ExecIn>(&mut stream).await.unwrap();
+            if let ExecIn::Stdin(data) = msg {
+                stdin.extend(data);
+                continue;
+            }
+            assert!(matches!(msg, ExecIn::StdinClose), "unexpected {msg:?}");
+            break;
+        }
+        // The process keeps running after its stdin closes.
+        let next = tokio::time::timeout(
+            Duration::from_millis(200),
+            bux_proto::recv::<ExecIn>(&mut stream),
+        )
+        .await;
+        assert!(
+            next.is_err(),
+            "host ended the connection after StdinClose: {next:?}"
+        );
+
+        bux_proto::send(&mut stream, &ExecOut::Stdout(stdin.clone()))
+            .await
+            .unwrap();
+        let exit = ExecOut::Exit {
+            code: 0,
+            signal: None,
+            timed_out: false,
+            duration_ms: 1,
+            error_message: None,
+        };
+        bux_proto::send(&mut stream, &exit).await.unwrap();
+        stdin
+    }
+
+    #[tokio::test]
+    async fn stdin_eof_keeps_exec_connection_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("g.sock");
+        let guest = tokio::spawn(stub_guest_exec(UnixListener::bind(&sock).unwrap()));
+
+        let handle = Client::new(&sock)
+            .exec(ExecStart::new("cat").with_stdin())
+            .await
+            .unwrap();
+        let out = handle
+            .stream_with_input(&b"hi\n"[..], |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(out.stdout, b"hi\n");
+        assert_eq!(out.code, 0);
+        assert_eq!(guest.await.unwrap(), b"hi\n");
     }
 }
