@@ -66,7 +66,7 @@ create_from_dir(
 | Variable | Description |
 | --- | --- |
 | `BUX_E2FS_DIR` | Path to a local directory containing pre-built static libraries. Skips downloading. |
-| `BUX_E2FS_VERSION` | Override the e2fsprogs release version (default: 1.47.4). |
+| `BUX_E2FS_VERSION` | Override the release to download, `e2fs-v{version}` (default: `1.47.4-1`, e2fsprogs 1.47.4 plus a packaging revision). |
 | `BUX_UPDATE_BINDINGS` | Copy generated bindings back to `src/bindings.rs` (with `regenerate` feature). |
 
 ## Supported platforms
@@ -76,6 +76,8 @@ create_from_dir(
 | `aarch64-apple-darwin` | ✅ |
 | `x86_64-unknown-linux-gnu` | ✅ |
 | `aarch64-unknown-linux-gnu` | ✅ |
+| `x86_64-unknown-linux-musl` | ✅ |
+| `aarch64-unknown-linux-musl` | ✅ |
 
 ## License
 

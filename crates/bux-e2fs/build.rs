@@ -10,8 +10,8 @@
 //!   libraries and headers. When set, skips downloading. Primary flow for
 //!   local development.
 //!
-//! - `BUX_E2FS_VERSION` — Override the e2fsprogs release version to download.
-//!   Defaults to `E2FSPROGS_VERSION`.
+//! - `BUX_E2FS_VERSION` — Override the release to download
+//!   (`e2fs-v{version}`). Defaults to `E2FS_RELEASE`.
 //!
 //! - `BUX_UPDATE_BINDINGS` — When set alongside the `regenerate` feature, the
 //!   freshly generated `bindings.rs` is copied back to `src/bindings.rs` so it
@@ -32,8 +32,10 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Pinned e2fsprogs version — keep in sync with `.github/workflows/e2fs-build.yml`.
-const E2FSPROGS_VERSION: &str = "1.47.4";
+/// Release to download, `e2fs-v{E2FS_RELEASE}`: e2fsprogs 1.47.4 plus a
+/// packaging revision (revision 1 adds the Linux musl targets). Keep in sync
+/// with `.github/workflows/e2fs-build.yml`.
+const E2FS_RELEASE: &str = "1.47.4-1";
 
 /// GitHub repository for downloading pre-built library releases.
 const GITHUB_REPO: &str = "qntx/bux";
@@ -66,13 +68,15 @@ fn main() {
 
     let lib_dir = obtain_libraries(&target, &out_dir);
 
-    // Static linking — all e2fsprogs libraries.
+    // Static linking. GNU ld scans each archive once, so every library comes
+    // before the ones it uses: create_inode needs ext2fs and e2p, and all of
+    // them need com_err.
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=static=create_inode");
     println!("cargo:rustc-link-lib=static=ext2fs");
-    println!("cargo:rustc-link-lib=static=com_err");
     println!("cargo:rustc-link-lib=static=e2p");
     println!("cargo:rustc-link-lib=static=uuid_e2fs");
-    println!("cargo:rustc-link-lib=static=create_inode");
+    println!("cargo:rustc-link-lib=static=com_err");
     println!("cargo:LIB_DIR={}", lib_dir.display());
 }
 
@@ -215,7 +219,7 @@ fn obtain_libraries(target: &str, out_dir: &Path) -> PathBuf {
         eprintln!("bux-e2fs: BUX_E2FS_DIR set but libs not found, downloading");
     }
 
-    let version = env::var("BUX_E2FS_VERSION").unwrap_or_else(|_| E2FSPROGS_VERSION.to_owned());
+    let version = env::var("BUX_E2FS_VERSION").unwrap_or_else(|_| E2FS_RELEASE.to_owned());
     let lib_dir = out_dir.join("e2fs").join("lib");
 
     if !lib_dir.join("libext2fs.a").exists() {
