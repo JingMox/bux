@@ -401,9 +401,18 @@ mod tests {
         );
     }
 
+    /// Open landlock ruleset fds in this process. Only rulesets: other tests
+    /// open and close fds concurrently, so a count of all fds is racy.
     #[cfg(target_os = "linux")]
-    fn fd_count() -> usize {
-        std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count)
+    fn landlock_fd_count() -> usize {
+        std::fs::read_dir("/proc/self/fd").map_or(0, |fds| {
+            fds.flatten()
+                .filter(|fd| {
+                    std::fs::read_link(fd.path())
+                        .is_ok_and(|target| target.as_os_str() == "anon_inode:[landlock-ruleset]")
+                })
+                .count()
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -413,13 +422,13 @@ mod tests {
             landlock: true,
             ..jail(None)
         };
-        let before = fd_count();
+        let before = landlock_fd_count();
         let err = spawn(Path::new("/usr/bin/true"), Path::new("/tmp/cfg.json"), cfg).unwrap_err();
         assert!(
             matches!(err, Error::BwrapUnavailable),
             "auto-detect without bwrap must fail closed: {err}"
         );
-        let after = fd_count();
+        let after = landlock_fd_count();
         assert_eq!(
             after, before,
             "BwrapUnavailable must not leak the landlock ruleset fd"
