@@ -16,7 +16,7 @@ mod fallback;
 #[cfg(not(target_os = "linux"))]
 use fallback as imp;
 
-use crate::{OciError, Result};
+use crate::{Error, Result};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,7 +62,7 @@ impl SafeRoot {
     /// exceeded, or a filesystem error occurs while walking.
     pub(crate) fn resolve(&self, rel: &Path) -> Result<PathBuf> {
         let rel = path::normalize_relative(rel)
-            .ok_or_else(|| OciError::Extract(format!("path escapes rootfs: {}", rel.display())))?;
+            .ok_or_else(|| Error::Extract(format!("path escapes rootfs: {}", rel.display())))?;
         if rel.as_os_str().is_empty() {
             return Ok(self.root.clone());
         }
@@ -73,7 +73,7 @@ impl SafeRoot {
                 path = %resolved.display(),
                 "extract write-escape"
             );
-            return Err(OciError::Extract(format!(
+            return Err(Error::Extract(format!(
                 "path escapes rootfs: {}",
                 resolved.display()
             )));

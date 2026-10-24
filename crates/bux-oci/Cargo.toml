@@ -10,20 +10,14 @@ keywords = ["oci", "container", "image", "registry"]
 categories = ["virtualization"]
 
 [dependencies]
-flate2.workspace = true
+bux-unpack.workspace = true
 oci-client.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tracing.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc.workspace = true
-pathrs = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

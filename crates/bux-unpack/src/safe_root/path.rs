@@ -5,13 +5,13 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use crate::{OciError, Result};
+use crate::{Error, Result};
 
 /// 256th follow is treated as a cycle or a crafted chain.
 pub(crate) const SYMLINK_HOP_LIMIT: u32 = 255;
 
-pub(crate) fn hop_limit_error(rel: &Path) -> OciError {
-    OciError::Extract(format!(
+pub(crate) fn hop_limit_error(rel: &Path) -> Error {
+    Error::Extract(format!(
         "symlink hop limit exceeded resolving {}",
         rel.display()
     ))
@@ -65,7 +65,7 @@ pub(super) fn resolve_walk(root: &Path, rel: &Path) -> Result<PathBuf> {
                     return Err(hop_limit_error(rel));
                 }
                 let target = std::fs::read_link(&full)
-                    .map_err(|e| OciError::Extract(format!("readlink {}: {e}", full.display())))?;
+                    .map_err(|e| Error::Extract(format!("readlink {}: {e}", full.display())))?;
                 resolved.pop();
                 if target.is_absolute() {
                     resolved = PathBuf::new();
@@ -81,7 +81,7 @@ pub(super) fn resolve_walk(root: &Path, rel: &Path) -> Result<PathBuf> {
                 if e.kind() == io::ErrorKind::NotFound
                     || e.kind() == io::ErrorKind::NotADirectory => {}
             Err(e) => {
-                return Err(OciError::Extract(format!(
+                return Err(Error::Extract(format!(
                     "resolve {} under {}: {e}",
                     rel.display(),
                     root.display()

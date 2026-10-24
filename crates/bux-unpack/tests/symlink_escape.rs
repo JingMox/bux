@@ -11,7 +11,7 @@ use std::fs::{self, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use bux_oci::{OciError, extract_layer_files};
+use bux_unpack::{Error, extract_layer_files};
 
 const LAYER: &str = "application/vnd.oci.image.layer.v1.tar";
 
@@ -115,7 +115,7 @@ fn extract(layers: &[PathBuf], rootfs: &Path) {
     extract_layer_files(&pairs, rootfs).unwrap();
 }
 
-fn extract_err(layers: &[PathBuf], rootfs: &Path) -> OciError {
+fn extract_err(layers: &[PathBuf], rootfs: &Path) -> Error {
     let pairs: Vec<(&Path, &str)> = layers.iter().map(|p| (p.as_path(), LAYER)).collect();
     extract_layer_files(&pairs, rootfs).unwrap_err()
 }
@@ -181,7 +181,7 @@ fn symlink_escape_whiteout_does_not_delete_host() {
 
     let err = extract_err(&[tar], &rootfs);
     assert!(
-        matches!(err, OciError::Extract(ref s) if s.contains("escapes")),
+        matches!(err, Error::Extract(ref s) if s.contains("escapes")),
         "whiteout through a host symlink must fail closed, got {err}"
     );
     assert!(
@@ -221,7 +221,7 @@ fn symlink_escape_whiteout_two_hop_does_not_delete_host() {
 
     let err = extract_err(&[tar], &rootfs);
     assert!(
-        matches!(err, OciError::Extract(ref s) if s.contains("escapes")),
+        matches!(err, Error::Extract(ref s) if s.contains("escapes")),
         "two-hop whiteout through a host symlink must fail closed, got {err}"
     );
     assert!(
@@ -308,7 +308,7 @@ fn opaque_whiteout_clears_only_in_root() {
 
     let err = extract_err(&[tar], &rootfs);
     assert!(
-        matches!(err, OciError::Extract(ref s) if s.contains("escapes")),
+        matches!(err, Error::Extract(ref s) if s.contains("escapes")),
         "opaque whiteout through a host symlink must fail closed, got {err}"
     );
     assert!(host_file.exists(), "host directory must not be cleared");
@@ -336,7 +336,7 @@ fn safe_root_hop_limit() {
 
     let err = extract_err(&[tar], &rootfs);
     assert!(
-        matches!(err, OciError::Extract(ref s) if s.contains("hop limit")),
+        matches!(err, Error::Extract(ref s) if s.contains("hop limit")),
         "256-hop chain must hit hop limit, got {err}"
     );
 }
@@ -508,7 +508,7 @@ fn missing_hardlink_target_is_error() {
     );
     let err = extract_err(&[tar], &rootfs);
     assert!(
-        matches!(err, OciError::Extract(ref s) if s.contains("hardlink target missing")),
+        matches!(err, Error::Extract(ref s) if s.contains("hardlink target missing")),
         "missing hardlink target must fail, got {err}"
     );
 }

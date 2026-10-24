@@ -1,8 +1,8 @@
 //! OCI image management for the bux micro-VM sandbox.
 //!
-//! Pulls, caches, and extracts OCI container images to a directory. Layer
-//! extract resolves members inside the destination root so a crafted symlink
-//! cannot write the host. The managed Runtime converts that directory into an
+//! Pulls, caches, and extracts OCI container images to a directory. Extraction
+//! is [`bux_unpack`]: it resolves members inside the destination root so a
+//! crafted symlink cannot write the host. The managed Runtime converts that directory into an
 //! ext4 base plus QCOW2 overlay (`DiskManager::create_managed_base`). Powered
 //! by [`oci_client`].
 //!
@@ -24,19 +24,17 @@
 
 mod config;
 mod error;
-mod extract;
-mod safe_root;
 mod store;
 
 use std::path::{Path, PathBuf};
 
+use bux_unpack::extract_layer_files;
 use oci_client::Reference;
 use oci_client::client::ClientConfig;
 use oci_client::secrets::RegistryAuth as ClientRegistryAuth;
 
 pub use config::{ImageConfig, OciConfig, PullResult, RegistryAuth};
 pub use error::{OciError, Result};
-pub use extract::extract_layer_files;
 pub use store::ImageMeta;
 use store::Store;
 

@@ -31,7 +31,7 @@ pub enum OciError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 
-    /// Layer extract refused a path (escape, hop limit, or invalid whiteout).
-    #[error("extract: {0}")]
-    Extract(String),
+    /// Layer extraction failed or refused a member.
+    #[error(transparent)]
+    Unpack(#[from] bux_unpack::Error),
 }

@@ -23,6 +23,7 @@ jobs:
         bux-bwrap
         bux-e2fs
         bux-krun
+        bux-unpack
         bux-oci
         bux-jail
         bux-shim
