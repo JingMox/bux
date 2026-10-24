@@ -1,0 +1,26 @@
+[package]
+name = "bux-unpack"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Safe OCI layer extraction with whiteouts for the bux micro-VM sandbox"
+keywords = ["oci", "container", "layer", "tar"]
+categories = ["filesystem"]
+
+[dependencies]
+flate2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+pathrs = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

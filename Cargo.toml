@@ -24,6 +24,7 @@ bux-gvproxy = { version = "0.2", path = "crates/bux-gvproxy" }
 bux-landlock = { version = "0.2", path = "crates/bux-landlock" }
 bux-qcow2 = { version = "0.2", path = "crates/bux-qcow2" }
 bux-seccomp = { version = "0.2", path = "crates/bux-seccomp" }
+bux-unpack = { version = "0.1", path = "crates/bux-unpack" }
 
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }

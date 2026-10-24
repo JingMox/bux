@@ -15,7 +15,7 @@ use tar::{Archive, EntryType};
 use tracing::{debug, error};
 
 use crate::safe_root::{SYMLINK_HOP_LIMIT, SafeRoot, hop_limit_error};
-use crate::{OciError, Result};
+use crate::{Error, Result};
 
 /// Media types recognized as gzip-compressed layers.
 const GZIP_MEDIA_TYPES: &[&str] = &[
@@ -187,10 +187,10 @@ impl LayerExtractor {
         unpacked: &mut HashSet<PathBuf>,
     ) -> Result<()> {
         let target = entry.link_name()?.ok_or_else(|| {
-            OciError::Extract(format!("hardlink without target: {}", raw_path.display()))
+            Error::Extract(format!("hardlink without target: {}", raw_path.display()))
         })?;
         let target_rel = SafeRoot::normalize(&target).ok_or_else(|| {
-            OciError::Extract(format!(
+            Error::Extract(format!(
                 "hardlink target escapes rootfs: {}",
                 target.display()
             ))
@@ -225,7 +225,7 @@ impl LayerExtractor {
             let target_safe = self.root.resolve_or_root(&tp)?.join(&tl);
             ensure_inside(self.root.root_path(), &target_safe)?;
             if fs::symlink_metadata(&target_safe).is_err() {
-                return Err(OciError::Extract(format!(
+                return Err(Error::Extract(format!(
                     "hardlink target missing: {}",
                     item.target_rel.display()
                 )));
@@ -301,9 +301,9 @@ fn create_symlink<R: Read>(
     safe_path: &Path,
     entry: &tar::Entry<'_, R>,
 ) -> Result<()> {
-    let target = entry.link_name()?.ok_or_else(|| {
-        OciError::Extract(format!("symlink without target: {}", raw_path.display()))
-    })?;
+    let target = entry
+        .link_name()?
+        .ok_or_else(|| Error::Extract(format!("symlink without target: {}", raw_path.display())))?;
     std::os::unix::fs::symlink(&target, safe_path)?;
     Ok(())
 }
@@ -323,7 +323,7 @@ fn ensure_inside(root: &Path, path: &Path) -> Result<()> {
         path = %path.display(),
         "extract write-escape"
     );
-    Err(OciError::Extract(format!(
+    Err(Error::Extract(format!(
         "path escapes rootfs: {}",
         path.display()
     )))
@@ -430,7 +430,7 @@ fn apply_whiteout(
 
     if let Some(target_name) = base.strip_prefix(".wh.") {
         if target_name.is_empty() || target_name == "." || target_name == ".." {
-            return Err(OciError::Extract(format!("invalid whiteout name: {base}")));
+            return Err(Error::Extract(format!("invalid whiteout name: {base}")));
         }
         let parent_rel = rel.parent().unwrap_or_else(|| Path::new(""));
         refuse_whiteout_escape(root, parent_rel)?;
@@ -468,7 +468,7 @@ fn refuse_whiteout_escape(root: &SafeRoot, parent_rel: &Path) -> Result<()> {
         path = %parent_rel.display(),
         "extract write-escape"
     );
-    Err(OciError::Extract(format!(
+    Err(Error::Extract(format!(
         "path escapes rootfs: {}",
         parent_rel.display()
     )))
@@ -517,7 +517,7 @@ fn whiteout_parent_escapes(root: &Path, parent_rel: &Path) -> Result<bool> {
                     return Err(hop_limit_error(parent_rel));
                 }
                 let target = fs::read_link(&full)
-                    .map_err(|e| OciError::Extract(format!("readlink {}: {e}", full.display())))?;
+                    .map_err(|e| Error::Extract(format!("readlink {}: {e}", full.display())))?;
                 resolved.pop();
                 match classify_host_target(root, &root.join(&resolved), &target) {
                     HostFollow::Escape => return Ok(true),

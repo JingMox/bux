@@ -410,19 +410,15 @@ dependencies = [
 name = "bux-oci"
 version = "0.9.0"
 dependencies = [
- "flate2",
- "libc",
+ "bux-unpack",
  "oci-client",
- "pathrs",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
- "tar",
  "tempfile",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -491,6 +487,19 @@ version = "0.2.0"
 dependencies = [
  "bux-gvproxy",
  "bux-shim",
+]
+
+[[package]]
+name = "bux-unpack"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "libc",
+ "pathrs",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
