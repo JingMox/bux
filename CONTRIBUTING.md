@@ -23,8 +23,10 @@ Requires a working C toolchain for libkrun / e2fs / qcow2 native deps, and Go fo
 
 ## Native libraries
 
-Prebuilt libkrun, e2fsprogs, and (Linux) bubblewrap download from GitHub
-Releases tagged `krun-v{LIBKRUN_VERSION}` (not crate versions).
+Prebuilt native libraries download from GitHub Releases, not crate versions:
+libkrun from `krun-v{LIBKRUN_VERSION}`, e2fsprogs from `e2fs-v{E2FS_RELEASE}`
+(the e2fsprogs version plus a packaging revision, e.g. `1.47.4-1`), and
+(Linux) bubblewrap from `bwrap-v{BUBBLEWRAP_VERSION}`.
 
 ## Capture environment
 
