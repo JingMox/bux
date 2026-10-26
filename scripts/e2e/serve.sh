@@ -126,8 +126,8 @@ dump_fail() {
   cat "${RESP}" >&2 2>/dev/null || true
   echo "serve.log:" >&2
   cat "${BUX_HOME}/serve.log" >&2 2>/dev/null || true
-  echo "shim stderr:" >&2
-  cat "${BUX_HOME}/socks/"*.stderr >&2 2>/dev/null || true
+  echo "VM logs:" >&2
+  cat "${BUX_HOME}/socks/"*.log >&2 2>/dev/null || true
 }
 
 require_http() {

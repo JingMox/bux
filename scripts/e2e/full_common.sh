@@ -98,8 +98,8 @@ create_or_dump() {
   if bux create "$@"; then
     return 0
   fi
-  echo "==> bux create failed; shim stderr:" >&2
-  cat "${BUX_HOME}/socks/"*.stderr >&2 2>/dev/null || true
+  echo "==> bux create failed; VM logs:" >&2
+  cat "${BUX_HOME}/socks/"*.log >&2 2>/dev/null || true
   return 1
 }
 

@@ -26,7 +26,7 @@ struct SpawnAbort<'a> {
     rt: &'a Runtime,
     /// VM id allocated for this spawn.
     id: String,
-    /// Vsock socket path (also locates json/stderr/exit files).
+    /// Vsock socket path (also locates json/log/exit files).
     socket: PathBuf,
     /// Shim process once spawned (`None` until jail spawn succeeds).
     process: Option<ShimProcess>,
@@ -318,8 +318,8 @@ pub(crate) fn spawn_shim(
         keep: false,
     };
 
-    let stderr_path = config_path.with_extension("stderr");
-    let stderr_file = fs::File::create(&stderr_path)?;
+    let log_path = config_path.with_extension("log");
+    let log_file = fs::File::create(&log_path)?;
 
     let shim = find_shim(shim_path)?;
 
@@ -354,7 +354,7 @@ pub(crate) fn spawn_shim(
             .map(|v| PathBuf::from(&v.path))
             .collect(),
         sandbox,
-        stderr_file: Some(stderr_file),
+        log_file: Some(log_file),
         landlock: sec.landlock,
         allow_degraded_security: sec.allow_degraded,
         die_with_parent: policy.die_with_parent,
@@ -662,7 +662,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn spawn_shim_missing_bwrap_does_not_write_json_or_stderr() {
+    fn spawn_shim_missing_bwrap_does_not_write_json_or_log() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("vm.json");
         let cfg = VmConfig {
@@ -684,8 +684,8 @@ mod tests {
             "must not write shim JSON before the bwrap check"
         );
         assert!(
-            !config_path.with_extension("stderr").exists(),
-            "must not create stderr before the bwrap check"
+            !config_path.with_extension("log").exists(),
+            "must not create the log before the bwrap check"
         );
     }
 }

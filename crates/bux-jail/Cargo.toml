@@ -20,5 +20,8 @@ nix.workspace = true
 bux-bwrap.workspace = true
 bux-landlock = { path = "../bux-landlock", version = "0.2" }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

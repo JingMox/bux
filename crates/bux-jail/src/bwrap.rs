@@ -76,7 +76,7 @@ mod tests {
             socks_dir: PathBuf::from("/tmp/bux-socks"),
             virtiofs_paths: vec![],
             sandbox: None,
-            stderr_file: None,
+            log_file: None,
             landlock: false,
             allow_degraded_security: false,
             die_with_parent,
