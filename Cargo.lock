@@ -309,6 +309,7 @@ name = "bux-bwrap"
 version = "0.3.0"
 dependencies = [
  "flate2",
+ "sha2",
  "tar",
  "thiserror",
  "ureq",
@@ -338,6 +339,7 @@ version = "0.3.0"
 dependencies = [
  "bindgen",
  "flate2",
+ "sha2",
  "tar",
  "tempfile",
  "thiserror",
@@ -392,6 +394,7 @@ version = "0.4.0"
 dependencies = [
  "bindgen",
  "flate2",
+ "sha2",
  "tar",
  "thiserror",
  "ureq",

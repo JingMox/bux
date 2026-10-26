@@ -85,7 +85,7 @@ fs.flush()?;
 | Variable | Description |
 | --- | --- |
 | `BUX_E2FS_DIR` | Path to a local directory containing pre-built static libraries. Skips downloading. |
-| `BUX_E2FS_VERSION` | Override the release to download, `e2fs-v{version}` (default: `1.47.4-1`, e2fsprogs 1.47.4 plus a packaging revision). |
+| `BUX_E2FS_VERSION` | Override the release to download, `e2fs-v{version}` (default: `1.47.4-1`, e2fsprogs 1.47.4 plus a packaging revision). Only the default release is checked against its pinned SHA-256. |
 | `BUX_UPDATE_BINDINGS` | Copy generated bindings back to `src/bindings.rs` (with `regenerate` feature). |
 
 ## Supported platforms

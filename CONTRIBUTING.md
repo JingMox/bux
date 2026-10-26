@@ -28,6 +28,14 @@ libkrun from `krun-v{LIBKRUN_VERSION}`, e2fsprogs from `e2fs-v{E2FS_RELEASE}`
 (the e2fsprogs version plus a packaging revision, e.g. `1.47.4-1`), and
 (Linux) bubblewrap from `bwrap-v{BUBBLEWRAP_VERSION}`.
 
+The build scripts retry each download and check it against the SHA-256 pinned
+per target next to the version constant (`DEPS_SHA256`, `E2FS_SHA256`,
+`BWRAP_SHA256`). When you bump a version, update its table in the same PR:
+`gh release download <tag> --repo qntx/bux` and `shasum -a 256` on each asset.
+A release picked with `BUX_DEPS_VERSION`, `BUX_E2FS_VERSION` or
+`BUX_BWRAP_VERSION` has no pinned hash and is not checked; the `BUX_*_DIR`
+overrides are local files and are not checked either.
+
 ## Capture environment
 
 | Variable | Purpose |
