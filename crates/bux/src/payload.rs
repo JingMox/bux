@@ -55,15 +55,18 @@ pub fn default_payload_dir() -> PathBuf {
     dirs::data_dir().map_or_else(|| PathBuf::from("bux-pkg"), |d| d.join("bux-pkg"))
 }
 
-/// Closed CD-matrix host triple. Musl host and Intel Mac are `InvalidConfig`.
+/// Closed CD-matrix host triple. A musl build and Intel Mac are `InvalidConfig`.
+///
+/// A glibc build that runs at all can run the glibc shim, so a musl loader on
+/// disk (e.g. from `musl-tools`) does not make the host unsupported.
 ///
 /// # Errors
 ///
-/// Unsupported OS/arch, musl host, or Intel Mac.
+/// Unsupported OS/arch, a musl build of bux, or Intel Mac.
 pub(crate) fn host_target() -> Result<&'static str> {
-    if cfg!(target_os = "linux") && musl_host() {
+    if cfg!(all(target_os = "linux", target_env = "musl")) {
         return Err(Error::InvalidConfig(format!(
-            "musl host is unsupported; {INSTALL_HINT}"
+            "musl builds of bux are unsupported; {INSTALL_HINT}"
         )));
     }
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -267,13 +270,6 @@ fn release_base() -> String {
         return base;
     }
     RELEASE_DOWNLOAD.to_owned()
-}
-
-fn musl_host() -> bool {
-    if cfg!(target_env = "musl") {
-        return true;
-    }
-    Path::new(&format!("/lib/ld-musl-{}.so.1", std::env::consts::ARCH)).exists()
 }
 
 fn darwin_arm64_capable() -> bool {

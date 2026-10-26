@@ -113,23 +113,27 @@ http() {
     done
 }
 
+# True if the host is musl: no glibc loader $1 but a musl loader $2, both for
+# the target architecture. musl-tools on a glibc distro adds a musl loader.
+# $3 roots both paths (tests only).
+musl_host() {
+    [ ! -e "${3:-}$1" ] && [ -e "${3:-}$2" ]
+}
+
 # Closed CD-matrix map. Musl host and Intel Mac are errors, not a 404 tarball.
 host_target() {
     _ht_os=$(uname -s)
     _ht_arch=$(uname -m)
     case "$_ht_os" in
         Linux)
-            for _ht_p in /lib /lib64 /usr/lib; do
-                # shellcheck disable=SC2086
-                ls "$_ht_p"/ld-musl-* >/dev/null 2>&1 && {
-                    err "unsupported host: musl libc (bux ships *-unknown-linux-gnu only)"
-                }
-            done
             case "$_ht_arch" in
-                x86_64 | amd64) printf '%s\n' "x86_64-unknown-linux-gnu" ;;
-                aarch64 | arm64) printf '%s\n' "aarch64-unknown-linux-gnu" ;;
+                x86_64 | amd64) _ht_m=x86_64 _ht_ld=/lib64/ld-linux-x86-64.so.2 ;;
+                aarch64 | arm64) _ht_m=aarch64 _ht_ld=/lib/ld-linux-aarch64.so.1 ;;
                 *) err "unsupported architecture: $_ht_arch" ;;
             esac
+            musl_host "$_ht_ld" "/lib/ld-musl-$_ht_m.so.1" \
+                && err "unsupported host: musl libc (bux ships *-unknown-linux-gnu only)"
+            printf '%s\n' "$_ht_m-unknown-linux-gnu"
             ;;
         Darwin)
             if [ "$_ht_arch" = x86_64 ] \
