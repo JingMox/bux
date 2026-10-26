@@ -866,9 +866,13 @@ mod tests {
     }
 
     fn dummy_offline_runtime() -> (tempfile::TempDir, Runtime, PathBuf) {
+        dummy_runtime_with_shim("#!/bin/sh\nexec /bin/sleep 30\n")
+    }
+
+    fn dummy_runtime_with_shim(script: &str) -> (tempfile::TempDir, Runtime, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let shim = dir.path().join("dummy-shim");
-        fs::write(&shim, b"#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        fs::write(&shim, script).unwrap();
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
         let overlay = dir.path().join("overlay.raw");
         fs::write(&overlay, b"not-qcow").unwrap();
@@ -1986,6 +1990,36 @@ mod tests {
             SystemTime::UNIX_EPOCH,
             "failed ready must not persist last_activity_at"
         );
+    }
+
+    #[test]
+    fn start_fails_fast_when_the_shim_dies_before_ready() {
+        // Alive long enough to be identified, then killed like a seccomp
+        // kill. The dead shim is a zombie until someone reaps it.
+        let (_dir, rt, overlay) =
+            dummy_runtime_with_shim("#!/bin/sh\nulimit -c 0\n/bin/sleep 1\nkill -SYS $$\n");
+        let id = "shimdies00001";
+        insert_idle_stopped(&rt, &overlay, id);
+
+        let mut vm = rt.get_exact(id).unwrap();
+        let started = std::time::Instant::now();
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(vm.start_with(StartOptions {
+                ready_timeout: Some(Duration::from_secs(30)),
+                secrets: Vec::new(),
+            }))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "a dead shim must not wait out the ready timeout: {msg}"
+        );
+        assert!(msg.contains("died before ready"), "{msg}");
+        #[cfg(target_os = "linux")]
+        assert!(msg.contains("SIGSYS"), "{msg}");
     }
 
     #[test]

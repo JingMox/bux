@@ -747,7 +747,9 @@ impl Vm {
             loop {
                 if !process.is_alive() {
                     return Err(crate::Error::GuestUnavailable(shim_death_message(
-                        pid, &exit_file,
+                        pid,
+                        &exit_file,
+                        process.try_reap(),
                     )));
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
