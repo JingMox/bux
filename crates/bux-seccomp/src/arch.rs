@@ -16,8 +16,9 @@ pub const AUDIT_ARCH: u32 = 0xc000_00b7;
 
 /// Syscalls allowed for the bux-shim VMM process on `x86_64`.
 ///
-/// Sorted and unique; frozen by a unit test. Covers libkrun plus the
-/// in-process gvproxy/Go runtime (clone3, rseq, netpoll, timers).
+/// Sorted and unique; frozen by a unit test. Covers libkrun, including the
+/// virtio-blk (imago) and virtio-fs passthrough backends, plus the in-process
+/// gvproxy/Go runtime (clone3, rseq, netpoll, timers).
 pub const X86_64_ALLOWLIST: &[u32] = &[
     0,   // read
     1,   // write
@@ -75,6 +76,7 @@ pub const X86_64_ALLOWLIST: &[u32] = &[
     73,  // flock
     74,  // fsync
     75,  // fdatasync
+    77,  // ftruncate
     78,  // getdents
     79,  // getcwd
     80,  // chdir
@@ -83,6 +85,7 @@ pub const X86_64_ALLOWLIST: &[u32] = &[
     87,  // unlink
     89,  // readlink
     91,  // fchmod
+    95,  // umask
     96,  // gettimeofday
     97,  // getrlimit
     102, // getuid
@@ -90,10 +93,23 @@ pub const X86_64_ALLOWLIST: &[u32] = &[
     107, // geteuid
     108, // getegid
     110, // getppid
+    117, // setresuid
+    119, // setresgid
+    125, // capget
+    126, // capset
     131, // sigaltstack
+    138, // fstatfs
     157, // prctl
     158, // arch_prctl
     186, // gettid
+    189, // lsetxattr
+    190, // fsetxattr
+    192, // lgetxattr
+    193, // fgetxattr
+    195, // llistxattr
+    196, // flistxattr
+    198, // lremovexattr
+    199, // fremovexattr
     200, // tkill
     202, // futex
     204, // sched_getaffinity
@@ -109,7 +125,15 @@ pub const X86_64_ALLOWLIST: &[u32] = &[
     233, // epoll_ctl
     234, // tgkill
     257, // openat
+    258, // mkdirat
+    259, // mknodat
+    260, // fchownat
     262, // newfstatat
+    263, // unlinkat
+    265, // linkat
+    266, // symlinkat
+    267, // readlinkat
+    268, // fchmodat
     269, // faccessat
     271, // ppoll
     273, // set_robust_list
@@ -117,14 +141,19 @@ pub const X86_64_ALLOWLIST: &[u32] = &[
     281, // epoll_pwait
     282, // signalfd4
     284, // eventfd
+    285, // fallocate
     288, // accept4
     290, // eventfd2
     291, // epoll_create1
     292, // dup3
     293, // pipe2
+    295, // preadv
+    296, // pwritev
     302, // prlimit64
     309, // getcpu
+    316, // renameat2
     318, // getrandom
+    326, // copy_file_range
     332, // statx
     334, // rseq
     435, // clone3
@@ -138,10 +167,19 @@ pub const X86_64_ALLOWLIST: &[u32] = &[
 /// Syscalls allowed for the bux-shim VMM process on `aarch64`.
 ///
 /// Sorted and unique; frozen by a unit test. Numbers and names from
-/// `asm-generic/unistd.h`. Covers libkrun plus in-process gvproxy/Go
-/// (clone3, rseq, netpoll, timers). `ptrace` is not listed.
+/// `asm-generic/unistd.h`. Covers libkrun, including the virtio-blk (imago)
+/// and virtio-fs passthrough backends, plus in-process gvproxy/Go (clone3,
+/// rseq, netpoll, timers). `ptrace` is not listed.
 pub const AARCH64_ALLOWLIST: &[u32] = &[
     0,   // io_setup
+    6,   // lsetxattr
+    7,   // fsetxattr
+    9,   // lgetxattr
+    10,  // fgetxattr
+    12,  // llistxattr
+    13,  // flistxattr
+    15,  // lremovexattr
+    16,  // fremovexattr
     17,  // getcwd
     19,  // eventfd2
     20,  // epoll_create1
@@ -151,13 +189,20 @@ pub const AARCH64_ALLOWLIST: &[u32] = &[
     24,  // dup3
     25,  // fcntl
     29,  // ioctl (KVM uses many)
+    33,  // mknodat
     34,  // mkdirat
     35,  // unlinkat
+    36,  // symlinkat
+    37,  // linkat
     38,  // renameat
+    44,  // fstatfs
     46,  // ftruncate
+    47,  // fallocate
     48,  // faccessat
     49,  // chdir
     52,  // fchmod
+    53,  // fchmodat
+    54,  // fchownat
     56,  // openat
     57,  // close
     59,  // pipe2
@@ -169,12 +214,17 @@ pub const AARCH64_ALLOWLIST: &[u32] = &[
     66,  // writev
     67,  // pread64
     68,  // pwrite64
+    69,  // preadv
+    70,  // pwritev
     73,  // ppoll
     78,  // readlinkat
     79,  // newfstatat
     80,  // fstat
     82,  // fsync
     83,  // fdatasync
+    88,  // utimensat
+    90,  // capget
+    91,  // capset
     93,  // exit
     94,  // exit_group
     96,  // set_tid_address
@@ -199,7 +249,10 @@ pub const AARCH64_ALLOWLIST: &[u32] = &[
     135, // rt_sigprocmask
     137, // rt_sigtimedwait
     139, // rt_sigreturn
+    147, // setresuid
+    149, // setresgid
     160, // uname
+    166, // umask
     167, // prctl
     172, // getpid
     173, // getppid
@@ -236,7 +289,9 @@ pub const AARCH64_ALLOWLIST: &[u32] = &[
     242, // accept4
     260, // wait4
     261, // prlimit64
+    276, // renameat2
     278, // getrandom
+    285, // copy_file_range
     291, // statx
     293, // rseq
     435, // clone3
@@ -313,6 +368,41 @@ mod tests {
             AARCH64_ALLOWLIST.contains(&293),
             "rseq missing from aarch64 allowlist"
         );
+    }
+
+    #[test]
+    fn allowlists_include_disk_and_virtiofs_io() {
+        // libkrun's virtio-blk (imago) and virtio-fs passthrough threads make
+        // these; one missing entry kills the shim at the first disk or volume
+        // access.
+        for (nr, name) in [
+            (295, "preadv"),
+            (296, "pwritev"),
+            (285, "fallocate"),
+            (258, "mkdirat"),
+            (263, "unlinkat"),
+            (316, "renameat2"),
+            (193, "fgetxattr"),
+        ] {
+            assert!(
+                X86_64_ALLOWLIST.contains(&nr),
+                "{name} ({nr}) missing from x86_64 allowlist"
+            );
+        }
+        for (nr, name) in [
+            (69, "preadv"),
+            (70, "pwritev"),
+            (47, "fallocate"),
+            (34, "mkdirat"),
+            (35, "unlinkat"),
+            (276, "renameat2"),
+            (10, "fgetxattr"),
+        ] {
+            assert!(
+                AARCH64_ALLOWLIST.contains(&nr),
+                "{name} ({nr}) missing from aarch64 allowlist"
+            );
+        }
     }
 
     #[test]
