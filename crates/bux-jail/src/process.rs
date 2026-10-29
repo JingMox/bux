@@ -7,6 +7,9 @@
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::ExitStatusExt;
+use std::process::ExitStatus;
 use std::time::Duration;
 
 use nix::errno::Errno;
@@ -63,10 +66,44 @@ impl ShimProcess {
         self.start_time
     }
 
-    /// `true` while the pid still belongs to this process.
+    /// `true` while the pid still belongs to this process and it has not
+    /// exited. An exited child that is not reaped yet (a zombie) is not alive.
     #[must_use]
     pub fn is_alive(self) -> bool {
         start_time(self.pid) == Some(self.start_time)
+    }
+
+    /// Reap the process if it is an exited child of this process, and return
+    /// how it ended.
+    ///
+    /// `None` if it is still running, is not a child of this process, or was
+    /// already reaped. Linux only: there the exited process can still be told
+    /// apart from a reused pid. Elsewhere this always returns `None`.
+    #[must_use]
+    #[allow(
+        clippy::unused_self,
+        clippy::missing_const_for_fn,
+        reason = "only Linux can reap safely; elsewhere this returns None"
+    )]
+    pub fn try_reap(self) -> Option<ExitStatus> {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = stat(self.pid)?;
+            if stat.state != 'Z' || stat.start_time != self.start_time {
+                return None;
+            }
+            match waitpid(self.nix_pid(), Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::Exited(_, code)) => Some(ExitStatus::from_raw((code & 0xff) << 8)),
+                Ok(WaitStatus::Signaled(_, signal, core)) => Some(ExitStatus::from_raw(
+                    signal as i32 | if core { 0x80 } else { 0 },
+                )),
+                _ => None,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     /// Ask the process to exit (`SIGTERM`). A process that is gone is not an error.
@@ -109,7 +146,7 @@ impl ShimProcess {
         reason = "blocking wait runs on a blocking thread, not in async code"
     )]
     pub fn wait(self) {
-        if !self.is_alive() {
+        if self.try_reap().is_some() || !self.is_alive() {
             return;
         }
         if let Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) = waitpid(self.nix_pid(), None)
@@ -160,22 +197,42 @@ pub(crate) fn watchdog_pipe() -> io::Result<(OwnedFd, Keepalive)> {
     Ok((read_fd, Keepalive(write_fd)))
 }
 
-/// Start time of `pid`, or `None` if no such process exists.
+/// Start time of `pid`, or `None` if no such process exists or it has exited.
 #[cfg(target_os = "linux")]
 fn start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_stat_start_time(&stat)
+    stat(pid)
+        .filter(|stat| !matches!(stat.state, 'Z' | 'X'))
+        .map(|stat| stat.start_time)
 }
 
-/// Field 22 (`starttime`) of `/proc/<pid>/stat`.
+/// Fields of `/proc/<pid>/stat` that identify a process.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+struct Stat {
+    /// Field 3: `R`, `S`, `D`, ..., `Z` for a zombie, `X` for dead.
+    state: char,
+    /// Field 22: clock ticks since boot.
+    start_time: u64,
+}
+
+/// `/proc/<pid>/stat` of `pid`, or `None` if no such process exists.
+#[cfg(target_os = "linux")]
+fn stat(pid: u32) -> Option<Stat> {
+    parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Fields 3 (`state`) and 22 (`starttime`) of `/proc/<pid>/stat`.
 ///
 /// `comm` (field 2) may contain spaces and parentheses, so fields are
 /// counted from the last `)`, which closes it.
 #[cfg(any(target_os = "linux", test))]
-fn parse_stat_start_time(stat: &str) -> Option<u64> {
+fn parse_stat(stat: &str) -> Option<Stat> {
     let (_, rest) = stat.rsplit_once(')')?;
     // `rest` starts at field 3 (state); field 22 is 19 fields later.
-    rest.split_whitespace().nth(19)?.parse().ok()
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let start_time = fields.nth(18)?.parse().ok()?;
+    Some(Stat { state, start_time })
 }
 
 /// Start time of `pid`, or `None` if no such process exists.
@@ -220,12 +277,79 @@ mod tests {
         (child, process)
     }
 
+    /// A `/bin/sh -c` child that runs `script` once its stdin closes,
+    /// identified while it is still running.
+    #[cfg(target_os = "linux")]
+    fn exiting_child(script: &str) -> (Child, ShimProcess) {
+        let child = Command::new("/bin/sh")
+            .args(["-c", &format!("read _; {script}")])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let process = ShimProcess::from_pid(child.id()).unwrap();
+        (child, process)
+    }
+
+    /// Block until `pid` has exited and is a zombie.
+    #[cfg(target_os = "linux")]
+    fn wait_for_zombie(pid: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while stat(pid).is_some_and(|stat| stat.state != 'Z') {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} did not exit"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
-    fn parses_start_time_after_last_paren() {
+    fn parses_state_and_start_time_after_last_paren() {
         let stat = "42 (a) b (c)) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1 2";
-        assert_eq!(parse_stat_start_time(stat), Some(98_765));
-        assert_eq!(parse_stat_start_time("42 (x) S 1"), None);
-        assert_eq!(parse_stat_start_time("no paren"), None);
+        let expected = Stat {
+            state: 'S',
+            start_time: 98_765,
+        };
+        assert_eq!(parse_stat(stat), Some(expected));
+        let zombie = "7 (sh) Z 1 7 7 0 -1 4227084 0 0 0 0 0 0 0 0 20 0 1 0 555 0 0";
+        assert_eq!(parse_stat(zombie).map(|parsed| parsed.state), Some('Z'));
+        assert_eq!(parse_stat("42 (x) S 1"), None);
+        assert_eq!(parse_stat("no paren"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exited_child_is_not_alive_and_is_reaped_once() {
+        let (mut child, process) = exiting_child("exit 3");
+        assert!(
+            process.try_reap().is_none(),
+            "a running child is not reaped"
+        );
+        drop(child.stdin.take());
+        wait_for_zombie(process.pid());
+        assert!(!process.is_alive(), "a zombie is not alive");
+        assert_eq!(process.try_reap().unwrap().code(), Some(3));
+        assert!(process.try_reap().is_none(), "already reaped");
+        assert!(stat(process.pid()).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn try_reap_reports_the_killing_signal() {
+        let (mut child, process) = exiting_child("kill -KILL $$");
+        drop(child.stdin.take());
+        wait_for_zombie(process.pid());
+        assert_eq!(process.try_reap().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wait_reaps_an_exited_child() {
+        let (mut child, process) = exiting_child("exit 0");
+        drop(child.stdin.take());
+        wait_for_zombie(process.pid());
+        process.wait();
+        assert!(stat(process.pid()).is_none(), "wait must reap the zombie");
     }
 
     #[test]

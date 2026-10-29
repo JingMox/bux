@@ -3,6 +3,7 @@
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::process::ExitStatus;
 
 use bux_shim::{ShimGvproxy, ShimNetConn, ShimNetwork};
 
@@ -45,11 +46,33 @@ pub(crate) fn stderr_tail(path: &Path, last_n_lines: usize) -> String {
 }
 
 /// Builds a diagnostic message when the shim dies before the guest agent is ready.
-pub(crate) fn shim_death_message(pid: u32, exit_file: &Path) -> String {
-    let detail = bux_shim::ExitInfo::from_file(exit_file)
-        .map_or_else(|| "unknown reason".into(), |info| info.summary());
+///
+/// `status` is how the process ended, when it could be reaped. The shim's
+/// own `.exit` record wins; a signal it could not catch leaves none.
+pub(crate) fn shim_death_message(pid: u32, exit_file: &Path, status: Option<ExitStatus>) -> String {
+    let detail = bux_shim::ExitInfo::from_file(exit_file).map_or_else(
+        || status.map_or_else(|| "unknown reason".into(), exit_status_detail),
+        |info| info.summary(),
+    );
     let hint = stderr_tail(&exit_file.with_extension("stderr"), 5);
     format!("VM process (pid {pid}) died before ready: {detail}{hint}")
+}
+
+/// `SIGSYS` on Linux (`x86_64` and `aarch64`): a seccomp `KILL_PROCESS`.
+#[cfg(target_os = "linux")]
+const SIGSYS: i32 = 31;
+
+/// `status` as text. A seccomp kill, of the shim or of the shim under bwrap
+/// (which exits with 128 + the signal), points at the kernel log.
+fn exit_status_detail(status: ExitStatus) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(SIGSYS) || status.code() == Some(128 + SIGSYS) {
+            return format!("{status}; killed by seccomp, `journalctl -k` shows the syscall");
+        }
+    }
+    status.to_string()
 }
 
 /// Timeout path: ready wait expired while the jail parent is still alive.
@@ -251,9 +274,27 @@ mod tests {
         assert!(msg.contains("4242"));
         assert!(msg.contains("stderr") && msg.contains(planted));
         assert!(stderr_tail(&stderr, 5).contains(planted));
-        let death = shim_death_message(4242, &exit);
+        let death = shim_death_message(4242, &exit, None);
         assert!(death.contains("died before ready"));
+        assert!(death.contains("unknown reason"));
         assert_ne!(msg, death);
+    }
+
+    #[test]
+    fn shim_death_message_includes_the_exit_status() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exit = dir.path().join("id.exit");
+        let killed = shim_death_message(7, &exit, Some(ExitStatus::from_raw(9)));
+        assert!(killed.contains("signal: 9 (SIGKILL)"), "{killed}");
+        let exited = shim_death_message(7, &exit, Some(ExitStatus::from_raw(3 << 8)));
+        assert!(exited.contains("exit status: 3"), "{exited}");
+        #[cfg(target_os = "linux")]
+        for raw in [31, 159 << 8] {
+            let seccomp = shim_death_message(7, &exit, Some(ExitStatus::from_raw(raw)));
+            assert!(seccomp.contains("journalctl -k"), "{seccomp}");
+        }
     }
 
     #[test]
