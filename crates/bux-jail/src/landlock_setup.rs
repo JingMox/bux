@@ -20,6 +20,9 @@ pub(crate) fn build_fd(
     restrictions.build().map_err(|e| e.to_string())
 }
 
+/// Files gvproxy reads to resolve names for a networked VM.
+const RESOLVER_FILES: &[&str] = &["/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"];
+
 /// Writable `/dev` leaves. `/dev` itself stays read-only because `PathBeneath` is recursive.
 const DEV_RW_LEAVES: &[&str] = &[
     "/dev/kvm",
@@ -82,10 +85,27 @@ fn path_restrictions(jail: &JailConfig, shim: &Path, config_path: &Path) -> Path
         r = r.allow_read_write(p);
     }
 
-    if !jail.network_host {
+    if jail.network_host {
+        r = allow_symlink_targets(r, RESOLVER_FILES);
+    } else {
         r = r.deny_network();
     }
 
+    r
+}
+
+/// Allow reading what `files` resolve to, and the directory holding it.
+///
+/// `/etc` is allowed anyway, but `/etc/resolv.conf` is usually a symlink out of
+/// it (systemd-resolved, `NetworkManager`), and Landlock checks the target. The
+/// directory is needed because these daemons replace the file by rename, and a
+/// rule attaches to the old inode.
+fn allow_symlink_targets(mut r: PathRestrictions, files: &[&str]) -> PathRestrictions {
+    for file in files {
+        if let Ok(target) = std::fs::canonicalize(file) {
+            r = allow_path_and_parent(r, &target, true);
+        }
+    }
     r
 }
 
@@ -192,6 +212,25 @@ mod tests {
             !r.network_denied(),
             "virtio-net VMs must bind host ports and egress"
         );
+    }
+
+    #[test]
+    fn symlink_targets_and_their_directory_are_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().canonicalize().unwrap().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let target = run.join("stub-resolv.conf");
+        std::fs::write(&target, b"nameserver 127.0.0.53\n").unwrap();
+        let link = dir.path().join("resolv.conf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let r = allow_symlink_targets(
+            PathRestrictions::new(),
+            &[link.to_str().unwrap(), "/nonexistent/resolv.conf"],
+        );
+
+        assert_eq!(r.read_paths(), [target, run]);
+        assert!(r.read_write_paths().is_empty());
     }
 
     #[test]
