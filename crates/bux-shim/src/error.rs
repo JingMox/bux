@@ -20,6 +20,10 @@ pub enum Error {
     #[error(transparent)]
     Krun(#[from] bux_krun::Error),
 
+    /// Landlock domain could not be entered (Linux fail-closed).
+    #[error("landlock: {0}")]
+    Landlock(String),
+
     /// Seccomp filter could not be installed (Linux fail-closed).
     #[error("seccomp: {0}")]
     Seccomp(String),
