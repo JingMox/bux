@@ -46,7 +46,15 @@ impl Sandbox for BwrapSandbox {
         }
         builder = builder.ro_bind(config_path, config_path);
 
-        Some(builder.program(shim).arg(config_path).into_command())
+        // The shim is PID 1 with bwrap's outer process as its parent, so it can
+        // die with that process, the one bux records (see the shim's watchdog).
+        Some(
+            builder
+                .run_as_pid_1()
+                .program(shim)
+                .arg(config_path)
+                .into_command(),
+        )
     }
 
     fn capabilities(&self) -> SandboxCapabilities {
@@ -144,12 +152,12 @@ mod tests {
         let spawned = crate::spawn(&shim, &config_path, cfg).unwrap();
         let group = spawned.process.pid();
 
-        // The outer bwrap, the inner bwrap and the shim.
+        // bwrap's outer process and the shim.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while live_group_members(group) < 3 && std::time::Instant::now() < deadline {
+        while live_group_members(group) < 2 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
-        assert_eq!(live_group_members(group), 3);
+        assert_eq!(live_group_members(group), 2);
 
         spawned.process.kill().unwrap();
         assert_eq!(live_group_members(group), 0);

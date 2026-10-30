@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Chaos e2e: SIGKILL the jail → inspect Stopped → rm without -f; no leftover overlay.
+# Chaos e2e: SIGKILL shim → inspect Stopped → rm without -f; no leftover overlay.
 # Requires BUX_E2E_FULL=1 (same pin as smoke.sh). GitHub-hosted CI keeps FULL=0.
 # No ulimit disk-full test.
 #
-# Pass: create → kill -9 the process group of the recorded PID → inspect
-# "Stopped" within 5s → bux rm without -f succeeds;
-# $BUX_HOME/disks/vms/{id}.qcow2 is gone.
+# Pass: create → kill -9 shim PID → inspect "Stopped" within 5s → bux rm
+# without -f succeeds; $BUX_HOME/disks/vms/{id}.qcow2 is gone.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -43,9 +42,8 @@ test -n "${shim_pid}" && test "${shim_pid}" != "0"
 overlay="${BUX_HOME}/disks/vms/${vm_id}.qcow2"
 test -f "${overlay}"
 
-# With the jailer the recorded pid is bwrap's outer process; its group holds the shim.
-echo "==> kill -9 process group ${shim_pid} (${vm_id})"
-kill -9 -- "-${shim_pid}" || true
+echo "==> kill -9 shim pid ${shim_pid} (${vm_id})"
+kill -9 "${shim_pid}" || true
 
 ok=0
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
@@ -59,6 +57,17 @@ done
 if [[ "${ok}" -ne 1 ]]; then
   echo "chaos: inspect did not report Stopped within 5s" >&2
   bux inspect "${NAME}" >&2 || true
+  exit 1
+fi
+
+# The recorded pid may be the jail's outer process: nothing of the VM may outlive it.
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  pgrep -f "${vm_id}" >/dev/null || break
+  sleep 0.25
+done
+if pgrep -f "${vm_id}" >/dev/null; then
+  echo "chaos: VM processes outlived the recorded pid" >&2
+  pgrep -af "${vm_id}" >&2 || true
   exit 1
 fi
 

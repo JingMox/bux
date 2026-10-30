@@ -64,11 +64,15 @@ fn parent_gone(fd: BorrowedFd<'_>, revents: nix::poll::PollFlags, buf: &mut [u8]
     }
 }
 
-/// Spawn a background thread that exits the process when the parent dies.
+/// Tie the process to what it must not outlive: the jail's outer process, and
+/// with `BUX_WATCHDOG_FD` the parent Runtime, through a background thread.
 ///
-/// No-op when `BUX_WATCHDOG_FD` is unset (detach mode).
+/// The thread is not started when `BUX_WATCHDOG_FD` is unset (detach mode).
 #[cfg(unix)]
 pub fn start_watchdog_thread() {
+    #[cfg(target_os = "linux")]
+    die_with_jail();
+
     let Ok(fd_str) = std::env::var(ENV_WATCHDOG_FD) else {
         return;
     };
@@ -97,6 +101,22 @@ pub fn start_watchdog_thread() {
         })
     {
         eprintln!("[bux-shim] failed to spawn watchdog thread: {e}");
+    }
+}
+
+/// Die with bwrap's outer process when this shim is PID 1 of a jail.
+///
+/// That process is the pid bux records for the VM: once it is gone, bux treats
+/// the VM as stopped, so the VM must really stop. bwrap's `--die-with-parent`
+/// cannot do this for a detached VM, because it also ties the outer process to
+/// the caller, which exits.
+#[cfg(target_os = "linux")]
+fn die_with_jail() {
+    if std::process::id() != 1 {
+        return;
+    }
+    if let Err(e) = nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL) {
+        eprintln!("[bux-shim] failed to tie the shim to its jail: {e}");
     }
 }
 

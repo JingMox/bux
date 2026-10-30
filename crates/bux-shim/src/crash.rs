@@ -99,5 +99,7 @@ extern "C" fn handle_crash_signal(sig: libc::c_int) {
     unsafe {
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
+        // PID 1 of a jail ignores its own signal.
+        libc::_exit(SIGNAL_EXIT_BASE + sig);
     }
 }
