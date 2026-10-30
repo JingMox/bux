@@ -33,6 +33,12 @@ impl Sandbox for BwrapSandbox {
             builder = builder.dev_bind("/dev/kvm", "/dev/kvm");
         }
 
+        // The tmpfs above may hide them. Before the writable binds: a read-only
+        // directory here must not cover a writable path beneath it.
+        for path in &jail.readonly_paths {
+            builder = builder.ro_bind(path, path);
+        }
+
         if let Some(rootfs) = &jail.rootfs {
             builder = builder.bind(rootfs, rootfs);
         }
@@ -63,7 +69,7 @@ impl Sandbox for BwrapSandbox {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, reason = "unit tests")]
+#[allow(clippy::unwrap_used, clippy::panic, reason = "unit tests")]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -103,6 +109,41 @@ mod tests {
             args_contain_die_with_parent(&cmd),
             "foreground jail must pass --die-with-parent"
         );
+    }
+
+    #[test]
+    fn readonly_paths_are_bound_before_writable_ones() {
+        let mut cfg = jail(false);
+        cfg.readonly_paths = vec![
+            PathBuf::from("/tmp/home/disks"),
+            PathBuf::from("/tmp/home/disks/base.raw"),
+        ];
+        cfg.root_disk = Some(PathBuf::from("/tmp/home/disks/vm.qcow2"));
+        let Some(cmd) =
+            BwrapSandbox.wrap(Path::new("/usr/bin/true"), Path::new("/tmp/cfg.json"), &cfg)
+        else {
+            return;
+        };
+        let args: Vec<_> = cmd.get_args().collect();
+        let position = |seq: &[&str]| {
+            args.windows(seq.len())
+                .position(|w| w.iter().zip(seq).all(|(arg, want)| *arg == *want))
+                .unwrap_or_else(|| panic!("no {seq:?} in {args:?}"))
+        };
+
+        let tmpfs = position(&["--tmpfs", "/tmp"]);
+        let dir = position(&["--ro-bind", "/tmp/home/disks", "/tmp/home/disks"]);
+        let base = position(&[
+            "--ro-bind",
+            "/tmp/home/disks/base.raw",
+            "/tmp/home/disks/base.raw",
+        ]);
+        let disk = position(&[
+            "--bind",
+            "/tmp/home/disks/vm.qcow2",
+            "/tmp/home/disks/vm.qcow2",
+        ]);
+        assert!(tmpfs < dir && dir < disk && base < disk, "{args:?}");
     }
 
     #[test]
