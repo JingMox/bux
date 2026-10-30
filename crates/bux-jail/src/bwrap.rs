@@ -5,11 +5,56 @@
 //! rootfs, sockets, and virtiofs paths.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use bux_bwrap::{BwrapCommand, Namespace};
 
 use super::{JailConfig, Sandbox, SandboxCapabilities, SandboxKind};
+
+/// The namespaces and base mounts of every jail.
+fn base_command(bwrap: &Path) -> Option<BwrapCommand> {
+    // `ro_bind("/", "/")` already covers resolver files (`/etc/resolv.conf`, `/etc/hosts`).
+    let mut builder = BwrapCommand::from_path(bwrap)
+        .ok()?
+        .unshare([Namespace::Pid, Namespace::Ipc, Namespace::Uts])
+        .ro_bind("/", "/")
+        .tmpfs("/tmp")
+        .tmpfs("/dev/shm");
+
+    if Path::new("/dev/kvm").exists() {
+        builder = builder.dev_bind("/dev/kvm", "/dev/kvm");
+    }
+    Some(builder)
+}
+
+/// Check that `bwrap` can start a jail on this host, by running it with the
+/// jail's namespaces and mounts around a command that does nothing.
+///
+/// # Errors
+///
+/// Returns what `bwrap` printed, or why it could not run.
+pub fn probe_bwrap(bwrap: &Path) -> Result<(), String> {
+    let builder =
+        base_command(bwrap).ok_or_else(|| format!("{} is not a file", bwrap.display()))?;
+    let output = builder
+        .program(bwrap)
+        .arg("--version")
+        .into_command()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    Err(if stderr.is_empty() {
+        output.status.to_string()
+    } else {
+        stderr.to_owned()
+    })
+}
 
 /// Bubblewrap (bwrap) sandbox for Linux.
 ///
@@ -20,17 +65,9 @@ pub(crate) struct BwrapSandbox;
 
 impl Sandbox for BwrapSandbox {
     fn wrap(&self, shim: &Path, config_path: &Path, jail: &JailConfig) -> Option<Command> {
-        let mut builder = BwrapCommand::from_path(jail.bwrap_path.as_ref()?)
-            .ok()?
-            .unshare([Namespace::Pid, Namespace::Ipc, Namespace::Uts]);
+        let mut builder = base_command(jail.bwrap_path.as_ref()?)?;
         if jail.die_with_parent {
             builder = builder.die_with_parent();
-        }
-        // `ro_bind("/", "/")` already covers resolver files (`/etc/resolv.conf`, `/etc/hosts`).
-        builder = builder.ro_bind("/", "/").tmpfs("/tmp").tmpfs("/dev/shm");
-
-        if Path::new("/dev/kvm").exists() {
-            builder = builder.dev_bind("/dev/kvm", "/dev/kvm");
         }
 
         if let Some(rootfs) = &jail.rootfs {
@@ -88,6 +125,70 @@ mod tests {
     fn args_contain_die_with_parent(cmd: &Command) -> bool {
         cmd.get_args()
             .any(|a| a == std::ffi::OsStr::new("--die-with-parent"))
+    }
+
+    /// A fake `bwrap` in `dir`: appends its arguments to `args`, then runs `body`.
+    fn fake_bwrap(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bwrap = dir.join("bwrap");
+        let args = dir.join("args");
+        std::fs::write(
+            &bwrap,
+            format!("#!/bin/sh\necho \"$@\" >> {}\n{body}\n", args.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bwrap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bwrap
+    }
+
+    #[test]
+    fn probe_runs_the_jail_namespaces_and_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let bwrap = fake_bwrap(dir.path(), "exit 0");
+
+        probe_bwrap(&bwrap).unwrap();
+
+        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
+        for flag in [
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--ro-bind / /",
+            "--tmpfs /tmp",
+            "--tmpfs /dev/shm",
+        ] {
+            assert!(args.contains(flag), "{flag} missing: {args}");
+        }
+        assert!(
+            args.trim_end()
+                .ends_with(&format!("-- {} --version", bwrap.display())),
+            "{args}"
+        );
+    }
+
+    #[test]
+    fn probe_returns_what_bwrap_printed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bwrap = fake_bwrap(
+            dir.path(),
+            "echo 'bwrap: setting up uid map: Permission denied' >&2; exit 1",
+        );
+        assert_eq!(
+            probe_bwrap(&bwrap).unwrap_err(),
+            "bwrap: setting up uid map: Permission denied"
+        );
+
+        let silent = fake_bwrap(dir.path(), "exit 3");
+        assert!(
+            probe_bwrap(&silent).unwrap_err().contains('3'),
+            "a silent failure reports its exit status"
+        );
+        assert!(
+            probe_bwrap(Path::new("/nonexistent/bwrap"))
+                .unwrap_err()
+                .contains("not a file")
+        );
     }
 
     #[test]
