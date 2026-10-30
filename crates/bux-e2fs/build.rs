@@ -11,7 +11,8 @@
 //!   local development.
 //!
 //! - `BUX_E2FS_VERSION` — Override the release to download
-//!   (`e2fs-v{version}`). Defaults to `E2FS_RELEASE`.
+//!   (`e2fs-v{version}`). Defaults to `E2FS_RELEASE`, whose archives are
+//!   checked against `E2FS_SHA256`. Other releases are not checked.
 //!
 //! - `BUX_UPDATE_BINDINGS` — When set alongside the `regenerate` feature, the
 //!   freshly generated `bindings.rs` is copied back to `src/bindings.rs` so it
@@ -30,7 +31,10 @@
 
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 /// Release to download, `e2fs-v{E2FS_RELEASE}`: e2fsprogs 1.47.4 plus a
 /// packaging revision (revision 1 adds the Linux musl targets). Keep in sync
@@ -39,6 +43,35 @@ const E2FS_RELEASE: &str = "1.47.4-1";
 
 /// GitHub repository for downloading pre-built library releases.
 const GITHUB_REPO: &str = "qntx/bux";
+
+/// Download attempts before the build gives up. The delay between attempts
+/// doubles from one second.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// SHA-256 of each `e2fs-v{E2FS_RELEASE}` asset, by target. Update it with the
+/// release: `gh release download <tag> --repo qntx/bux` and `shasum -a 256`.
+const E2FS_SHA256: &[(&str, &str)] = &[
+    (
+        "aarch64-apple-darwin",
+        "4811eff443ecc2a8b6a30613745bba5d571472e5f54a3c4dbd04bcda85fcb28a",
+    ),
+    (
+        "aarch64-unknown-linux-gnu",
+        "eabca1f82e838817d691e104b96915bba8c505fd07eacbc1ab5de409377d53bc",
+    ),
+    (
+        "aarch64-unknown-linux-musl",
+        "9ea0ac8523ca524a9ab7ae0e1fcd35dc5d9a56731bdb2c61b58ab7fee50f1711",
+    ),
+    (
+        "x86_64-unknown-linux-gnu",
+        "69c50ed8deb61ae151be442e7e54ca00c1987f134ee372e07ae97a4b4d450f04",
+    ),
+    (
+        "x86_64-unknown-linux-musl",
+        "c132b22d711031ae803516d8e1ad7652dfeaab9c6137a18990499fe422ace035",
+    ),
+];
 
 fn main() {
     println!("cargo:rerun-if-env-changed=BUX_E2FS_DIR");
@@ -241,16 +274,13 @@ fn download_libs(version: &str, target: &str, out_dir: &Path) {
     let url = format!(
         "https://github.com/{GITHUB_REPO}/releases/download/e2fs-v{version}/bux-e2fs-{target}.tar.gz"
     );
-    eprintln!("bux-e2fs: downloading {url}");
+    // Only the pinned release has known hashes.
+    let sha256 = (version == E2FS_RELEASE).then(|| pinned_sha256(E2FS_SHA256, target));
+    let archive = download(&url, sha256);
 
     let dest = out_dir.join("e2fs");
     fs::create_dir_all(&dest).expect("Failed to create e2fs dir");
-
-    let resp = ureq::get(&url)
-        .call()
-        .unwrap_or_else(|e| panic!("Failed to download e2fs deps: {e}"));
-
-    tar::Archive::new(flate2::read::GzDecoder::new(resp.into_body().into_reader()))
+    tar::Archive::new(flate2::read::GzDecoder::new(archive.as_slice()))
         .unpack(&dest)
         .expect("Failed to extract e2fs archive");
 
@@ -258,4 +288,77 @@ fn download_libs(version: &str, target: &str, out_dir: &Path) {
         dest.join("lib").join("libext2fs.a").exists(),
         "libext2fs.a not found after extraction. Check GitHub Release e2fs-v{version}."
     );
+}
+
+/// The pinned SHA-256 for `target`. A target without one has no release.
+fn pinned_sha256(table: &'static [(&str, &str)], target: &str) -> &'static str {
+    table.iter().find(|(t, _)| *t == target).map_or_else(
+        || panic!("bux-e2fs: no pinned SHA-256 for {target}"),
+        |(_, sha256)| *sha256,
+    )
+}
+
+/// Download `url`, retrying on errors, and check its SHA-256 when one is
+/// pinned for it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a build script has no async runtime; retries wait in place"
+)]
+fn download(url: &str, sha256: Option<&str>) -> Vec<u8> {
+    eprintln!("bux-e2fs: downloading {url}");
+    let mut delay = std::time::Duration::from_secs(1);
+    let mut attempt = 1;
+    let body = loop {
+        match fetch(url) {
+            Ok(body) => break body,
+            Err(e) if attempt < DOWNLOAD_ATTEMPTS => {
+                eprintln!(
+                    "bux-e2fs: attempt {attempt} of {DOWNLOAD_ATTEMPTS} failed: {e}; retrying"
+                );
+                std::thread::sleep(delay);
+                delay *= 2;
+                attempt += 1;
+            }
+            Err(e) => panic!(
+                "bux-e2fs: failed to download {url} after {DOWNLOAD_ATTEMPTS} attempts: {e}. \
+                 Without access to it, unpack that archive elsewhere and set BUX_E2FS_DIR \
+                 to the directory that holds its `lib/` and `include/`."
+            ),
+        }
+    };
+    match sha256 {
+        Some(expected) => {
+            let actual = sha256_hex(&body);
+            assert!(
+                actual == expected,
+                "bux-e2fs: SHA-256 mismatch for {url}: expected {expected}, got {actual}"
+            );
+        }
+        None => println!(
+            "cargo:warning=bux-e2fs: {url} is not the pinned release, so its SHA-256 is not checked"
+        ),
+    }
+    body
+}
+
+/// The body of `url`, without the size limit of `read_to_vec`.
+fn fetch(url: &str) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    ureq::get(url)
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_body()
+        .into_reader()
+        .read_to_end(&mut body)
+        .map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+/// Lowercase hex SHA-256 of `data`.
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(data) {
+        std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}")).ok();
+    }
+    hex
 }

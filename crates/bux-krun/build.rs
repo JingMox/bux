@@ -10,7 +10,8 @@
 //!   When set, skips downloading. Primary flow for local development.
 //!
 //! - `BUX_DEPS_VERSION` — Override the deps release version to download.
-//!   Defaults to the pinned `LIBKRUN_VERSION`.
+//!   Defaults to the pinned `LIBKRUN_VERSION`, whose archives are checked
+//!   against `DEPS_SHA256`. Other releases are not checked.
 //!
 //! - `BUX_UPDATE_BINDINGS` — When set alongside the `regenerate` feature, the
 //!   freshly generated `bindings.rs` is copied back to `src/bindings.rs` so it
@@ -32,13 +33,37 @@
 
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 /// Pinned native library versions — keep in sync with `.github/workflows/krun-build.yml`.
 const LIBKRUN_VERSION: &str = "1.19.6";
 const LIBKRUNFW_VERSION: &str = "5.5.0";
+
+/// Download attempts before the build gives up. The delay between attempts
+/// doubles from one second.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// SHA-256 of each `krun-v{LIBKRUN_VERSION}` asset, by target. Update it with the
+/// release: `gh release download <tag> --repo qntx/bux` and `shasum -a 256`.
+const DEPS_SHA256: &[(&str, &str)] = &[
+    (
+        "aarch64-apple-darwin",
+        "104ec1d11ae563a488d89ab70db879ac87e9a013e4bdca2f018c5c89ba664188",
+    ),
+    (
+        "aarch64-unknown-linux-gnu",
+        "601c2f1c8fdbcfd55aa1d79cce2ca98c8fb1e12788e772795ffe6254c5c9e3e7",
+    ),
+    (
+        "x86_64-unknown-linux-gnu",
+        "1cfc5c699c3b7a63ccfcc0d9d00aa0185d623dc3bb5164dd237cba012eaa7851",
+    ),
+];
 
 /// Base URL template for downloading the libkrun header.
 #[cfg(feature = "regenerate")]
@@ -126,7 +151,9 @@ fn download_header(out_dir: &Path) -> PathBuf {
         .unwrap_or_else(|e| panic!("Failed to download libkrun.h: {e}"));
 
     let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut resp.into_body().into_reader(), &mut buf)
+    resp.into_body()
+        .into_reader()
+        .read_to_end(&mut buf)
         .expect("Failed to read header");
     fs::write(&path, &buf).expect("Failed to write libkrun.h");
     path
@@ -364,14 +391,12 @@ fn download_libs(version: &str, target: &str, dest: &Path) {
     let url = format!(
         "https://github.com/{GITHUB_REPO}/releases/download/krun-v{version}/bux-deps-{target}.tar.gz"
     );
-    eprintln!("bux-krun: downloading {url}");
-
-    let resp = ureq::get(&url)
-        .call()
-        .unwrap_or_else(|e| panic!("Failed to download deps: {e}"));
+    // Only the pinned release has known hashes.
+    let sha256 = (version == LIBKRUN_VERSION).then(|| pinned_sha256(DEPS_SHA256, target));
+    let archive = download(&url, sha256);
 
     fs::create_dir_all(dest).expect("Failed to create lib dir");
-    tar::Archive::new(flate2::read::GzDecoder::new(resp.into_body().into_reader()))
+    tar::Archive::new(flate2::read::GzDecoder::new(archive.as_slice()))
         .unpack(dest)
         .expect("Failed to extract archive");
 
@@ -422,4 +447,77 @@ fn create_versioned_symlinks(dir: &Path, target: &str) {
         #[cfg(not(unix))]
         let _ = fs::copy(&src_path, &link_path);
     }
+}
+
+/// The pinned SHA-256 for `target`. A target without one has no release.
+fn pinned_sha256(table: &'static [(&str, &str)], target: &str) -> &'static str {
+    table.iter().find(|(t, _)| *t == target).map_or_else(
+        || panic!("bux-krun: no pinned SHA-256 for {target}"),
+        |(_, sha256)| *sha256,
+    )
+}
+
+/// Download `url`, retrying on errors, and check its SHA-256 when one is
+/// pinned for it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a build script has no async runtime; retries wait in place"
+)]
+fn download(url: &str, sha256: Option<&str>) -> Vec<u8> {
+    eprintln!("bux-krun: downloading {url}");
+    let mut delay = std::time::Duration::from_secs(1);
+    let mut attempt = 1;
+    let body = loop {
+        match fetch(url) {
+            Ok(body) => break body,
+            Err(e) if attempt < DOWNLOAD_ATTEMPTS => {
+                eprintln!(
+                    "bux-krun: attempt {attempt} of {DOWNLOAD_ATTEMPTS} failed: {e}; retrying"
+                );
+                std::thread::sleep(delay);
+                delay *= 2;
+                attempt += 1;
+            }
+            Err(e) => panic!(
+                "bux-krun: failed to download {url} after {DOWNLOAD_ATTEMPTS} attempts: {e}. \
+                 Without access to it, unpack that archive elsewhere and set BUX_DEPS_DIR \
+                 to the directory that holds its libraries."
+            ),
+        }
+    };
+    match sha256 {
+        Some(expected) => {
+            let actual = sha256_hex(&body);
+            assert!(
+                actual == expected,
+                "bux-krun: SHA-256 mismatch for {url}: expected {expected}, got {actual}"
+            );
+        }
+        None => println!(
+            "cargo:warning=bux-krun: {url} is not the pinned release, so its SHA-256 is not checked"
+        ),
+    }
+    body
+}
+
+/// The body of `url`, without the size limit of `read_to_vec`.
+fn fetch(url: &str) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    ureq::get(url)
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_body()
+        .into_reader()
+        .read_to_end(&mut body)
+        .map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+/// Lowercase hex SHA-256 of `data`.
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(data) {
+        std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}")).ok();
+    }
+    hex
 }

@@ -38,7 +38,7 @@ BUX_UPDATE_BINDINGS=1 cargo check -p bux-krun --features regenerate
 | Variable | Description |
 | --- | --- |
 | `BUX_DEPS_DIR` | Path to a local directory containing pre-built libraries. Skips downloading. |
-| `BUX_DEPS_VERSION` | Override the deps release version (default: pinned libkrun version). |
+| `BUX_DEPS_VERSION` | Override the deps release version (default: pinned libkrun version). Only the default release is checked against its pinned SHA-256. |
 | `BUX_UPDATE_BINDINGS` | Copy generated bindings back to `src/bindings.rs` (with `regenerate` feature). |
 
 ## Supported platforms

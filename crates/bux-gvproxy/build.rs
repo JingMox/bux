@@ -28,6 +28,10 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+/// `go mod download` attempts before the build gives up. The delay between
+/// attempts doubles from one second.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+
 fn go_os(os: &str) -> &'static str {
     match os {
         "linux" => "linux",
@@ -65,17 +69,7 @@ fn apply_go_target(cmd: &mut Command) {
 fn build_gvproxy(source_dir: &Path, output_path: &Path) {
     println!("cargo:warning=Building libgvproxy from Go sources...");
 
-    // Download Go dependencies.
-    let download = Command::new("go")
-        .args(["mod", "download"])
-        .current_dir(source_dir)
-        .status()
-        .expect("Failed to run 'go mod download' — is Go installed?");
-
-    assert!(
-        download.success(),
-        "Failed to download Go module dependencies"
-    );
+    download_modules(source_dir);
 
     // Build as C archive (static library).
     let mut cmd = Command::new("go");
@@ -189,4 +183,35 @@ fn main() {
     }
     #[cfg(not(target_os = "linux"))]
     println!("cargo:rustc-link-lib=resolv");
+}
+
+/// Download the Go module dependencies, retrying on failure. Modules already
+/// fetched stay in the module cache, so a retry only fetches the rest.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a build script has no async runtime; retries wait in place"
+)]
+fn download_modules(source_dir: &Path) {
+    let mut delay = std::time::Duration::from_secs(1);
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        let status = Command::new("go")
+            .args(["mod", "download"])
+            .current_dir(source_dir)
+            .status()
+            .expect("Failed to run 'go mod download' — is Go installed?");
+        if status.success() {
+            return;
+        }
+        if attempt < DOWNLOAD_ATTEMPTS {
+            eprintln!(
+                "bux-gvproxy: go mod download attempt {attempt} of {DOWNLOAD_ATTEMPTS} failed; retrying"
+            );
+            std::thread::sleep(delay);
+            delay *= 2;
+        }
+    }
+    panic!(
+        "Failed to download Go module dependencies after {DOWNLOAD_ATTEMPTS} attempts. \
+         If the default module proxy is unreachable, set GOPROXY to one that is."
+    );
 }
