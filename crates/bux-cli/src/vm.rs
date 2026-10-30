@@ -363,8 +363,10 @@ pub fn rm(args: &RmArgs) -> Result<()> {
         // Force mode: kill before removing.
         if args.force
             && let Ok(mut h) = rt.get(target)
+            && let Err(e) = h.kill()
         {
-            let _ = h.kill();
+            errors.push(format!("{target}: {e}"));
+            continue;
         }
         match rt.remove(target) {
             Ok(()) => println!("{target}"),

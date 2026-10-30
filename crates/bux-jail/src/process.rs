@@ -4,13 +4,18 @@
 //! exits, the OS may hand its pid to an unrelated process. [`ShimProcess`]
 //! pairs the pid with the process start time and treats a pid whose start
 //! time differs as a process that is gone.
+//!
+//! With a jail, the recorded process is not the shim: bwrap runs as an outer
+//! process, an inner one that is PID 1 of the new namespace, and then the shim.
+//! `spawn` makes the recorded process a process group leader, the others
+//! inherit the group, and signals go to the group.
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
@@ -18,11 +23,17 @@ use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{Pid, pipe};
 
+/// How long [`ShimProcess::kill`] waits for the killed processes to be gone.
+const KILL_WAIT: Duration = Duration::from_secs(10);
+
 /// A `bux-shim` process, identified by pid and start time.
 ///
 /// Plain identity: safe to persist and to rebuild with [`Self::open`]
 /// after a host restart. Every operation first checks that the pid still
 /// belongs to the same process, so a reused pid is never signalled.
+///
+/// The process must lead its own process group, as [`crate::spawn`] arranges:
+/// signals go to the group, which is the whole jail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShimProcess {
     /// OS process id.
@@ -106,7 +117,7 @@ impl ShimProcess {
         }
     }
 
-    /// Ask the process to exit (`SIGTERM`). A process that is gone is not an error.
+    /// Ask the process group to exit (`SIGTERM`). A process that is gone is not an error.
     ///
     /// # Errors
     ///
@@ -115,16 +126,19 @@ impl ShimProcess {
         self.send_if_alive(Signal::SIGTERM)
     }
 
-    /// Kill the process (`SIGKILL`). A process that is gone is not an error.
+    /// Kill the process group (`SIGKILL`) and wait until none of it is left,
+    /// up to 10 s. A process that is gone is not an error.
     ///
     /// # Errors
     ///
-    /// Returns the OS error if the signal cannot be delivered.
+    /// Returns the OS error if the signal cannot be delivered, and
+    /// [`io::ErrorKind::TimedOut`] if a process of the group is still alive.
     pub fn kill(self) -> io::Result<()> {
-        self.send_if_alive(Signal::SIGKILL)
+        self.send_if_alive(Signal::SIGKILL)?;
+        self.wait_group_gone(KILL_WAIT)
     }
 
-    /// Send the POSIX signal number `sig`.
+    /// Send the POSIX signal number `sig` to the process group.
     ///
     /// # Errors
     ///
@@ -135,7 +149,7 @@ impl ShimProcess {
         if !self.is_alive() {
             return Err(Errno::ESRCH.into());
         }
-        signal::kill(self.nix_pid(), sig).map_err(io::Error::from)
+        signal::killpg(self.nix_pid(), sig).map_err(io::Error::from)
     }
 
     /// Block until the process exits.
@@ -158,15 +172,74 @@ impl ShimProcess {
         }
     }
 
-    /// Deliver `sig` unless the pid no longer belongs to this process.
+    /// Deliver `sig` to the group unless the pid no longer belongs to this process.
     fn send_if_alive(self, sig: Signal) -> io::Result<()> {
         if !self.is_alive() {
             return Ok(());
         }
-        match signal::kill(self.nix_pid(), sig) {
+        match signal::killpg(self.nix_pid(), sig) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Poll until no process of the group is alive, reaping this process if it
+    /// is a child of this process.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "blocking wait runs on a blocking path; SIGKILL makes it short"
+    )]
+    fn wait_group_gone(self, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.reap_if_exited();
+            if !self.group_alive() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "process group {0} is still alive after {1} s; stop it with: kill -9 -- -{0}",
+                        self.pid,
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Reap this process if it is an exited child of this process.
+    fn reap_if_exited(self) {
+        #[cfg(target_os = "linux")]
+        let _reaped = self.try_reap();
+        // macOS still reports a zombie's start time, so `is_alive` vouches for the pid.
+        #[cfg(not(target_os = "linux"))]
+        if self.is_alive() {
+            let _reaped = waitpid(self.nix_pid(), Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        }
+    }
+
+    /// `true` while a process of the group is alive; zombies do not count.
+    ///
+    /// A group keeps its id reserved as a pid until its last process is gone. So
+    /// another process with this pid means the group is gone, and a pid that
+    /// no process holds can still name a group whose leader was killed alone.
+    #[cfg(target_os = "linux")]
+    fn group_alive(self) -> bool {
+        match stat(self.pid) {
+            Some(stat) if stat.start_time != self.start_time => false,
+            Some(stat) if !matches!(stat.state, 'Z' | 'X') => true,
+            _ => live_group_members(self.pid) > 0,
+        }
+    }
+
+    /// `true` while the process is alive. On macOS the group is the shim alone:
+    /// `sandbox-exec` execs it in place.
+    #[cfg(not(target_os = "linux"))]
+    fn group_alive(self) -> bool {
+        self.is_alive()
     }
 
     /// pid as a `nix` [`Pid`].
@@ -205,12 +278,28 @@ fn start_time(pid: u32) -> Option<u64> {
         .map(|stat| stat.start_time)
 }
 
+/// Processes in group `pgid` that have not exited.
+#[cfg(target_os = "linux")]
+pub(crate) fn live_group_members(pgid: u32) -> usize {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+        .filter_map(stat)
+        .filter(|stat| stat.pgrp == pgid && !matches!(stat.state, 'Z' | 'X'))
+        .count()
+}
+
 /// Fields of `/proc/<pid>/stat` that identify a process.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, PartialEq, Eq)]
 struct Stat {
     /// Field 3: `R`, `S`, `D`, ..., `Z` for a zombie, `X` for dead.
     state: char,
+    /// Field 5: process group id.
+    pgrp: u32,
     /// Field 22: clock ticks since boot.
     start_time: u64,
 }
@@ -221,18 +310,23 @@ fn stat(pid: u32) -> Option<Stat> {
     parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
-/// Fields 3 (`state`) and 22 (`starttime`) of `/proc/<pid>/stat`.
+/// Fields 3 (`state`), 5 (`pgrp`) and 22 (`starttime`) of `/proc/<pid>/stat`.
 ///
 /// `comm` (field 2) may contain spaces and parentheses, so fields are
 /// counted from the last `)`, which closes it.
 #[cfg(any(target_os = "linux", test))]
 fn parse_stat(stat: &str) -> Option<Stat> {
     let (_, rest) = stat.rsplit_once(')')?;
-    // `rest` starts at field 3 (state); field 22 is 19 fields later.
+    // `rest` starts at field 3 (state).
     let mut fields = rest.split_whitespace();
     let state = fields.next()?.chars().next()?;
-    let start_time = fields.nth(18)?.parse().ok()?;
-    Some(Stat { state, start_time })
+    let pgrp = fields.nth(1)?.parse().ok()?;
+    let start_time = fields.nth(16)?.parse().ok()?;
+    Some(Stat {
+        state,
+        pgrp,
+        start_time,
+    })
 }
 
 /// Start time of `pid`, or `None` if no such process exists.
@@ -267,23 +361,29 @@ fn start_time(pid: u32) -> Option<u64> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "unit tests")]
 mod tests {
+    use std::os::unix::process::CommandExt;
     use std::process::{Child, Command};
 
     use super::*;
 
     fn sleep_child() -> (Child, ShimProcess) {
-        let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
         let process = ShimProcess::from_pid(child.id()).unwrap();
         (child, process)
     }
 
-    /// A `/bin/sh -c` child that runs `script` once its stdin closes,
+    /// A `/bin/sh -c` group leader that runs `script` once its stdin closes,
     /// identified while it is still running.
     #[cfg(target_os = "linux")]
     fn exiting_child(script: &str) -> (Child, ShimProcess) {
         let child = Command::new("/bin/sh")
             .args(["-c", &format!("read _; {script}")])
             .stdin(std::process::Stdio::piped())
+            .process_group(0)
             .spawn()
             .unwrap();
         let process = ShimProcess::from_pid(child.id()).unwrap();
@@ -293,21 +393,19 @@ mod tests {
     /// Block until `pid` has exited and is a zombie.
     #[cfg(target_os = "linux")]
     fn wait_for_zombie(pid: u32) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while stat(pid).is_some_and(|stat| stat.state != 'Z') {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "pid {pid} did not exit"
-            );
+            assert!(Instant::now() < deadline, "pid {pid} did not exit");
             std::thread::yield_now();
         }
     }
 
     #[test]
     fn parses_state_and_start_time_after_last_paren() {
-        let stat = "42 (a) b (c)) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1 2";
+        let stat = "42 (a) b (c)) S 1 43 44 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1 2";
         let expected = Stat {
             state: 'S',
+            pgrp: 43,
             start_time: 98_765,
         };
         assert_eq!(parse_stat(stat), Some(expected));
@@ -385,6 +483,58 @@ mod tests {
         process.wait();
         assert!(!process.is_alive());
         process.kill().unwrap();
+    }
+
+    /// A second process in `leader`'s group, which the leader does not wait for.
+    #[cfg(target_os = "linux")]
+    fn group_member(leader: ShimProcess) -> Child {
+        Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(leader.pid().try_into().unwrap())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_takes_the_whole_group_and_waits() {
+        let (_child, process) = exiting_child("");
+        let mut member = group_member(process);
+        assert_eq!(live_group_members(process.pid()), 2);
+
+        process.kill().unwrap();
+
+        assert_eq!(live_group_members(process.pid()), 0);
+        assert!(!process.is_alive());
+        assert_eq!(member.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_member_outliving_the_leader_is_reported() {
+        let (mut leader, process) = exiting_child("exit 0");
+        let mut member = group_member(process);
+        drop(leader.stdin.take());
+        drop(leader.wait());
+
+        let err = process
+            .wait_group_gone(Duration::from_millis(50))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        drop(member.kill());
+        drop(member.wait());
+        process.wait_group_gone(KILL_WAIT).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reused_pid_means_the_group_is_gone() {
+        let (_child, live) = exiting_child("");
+        let reused = ShimProcess::open(live.pid(), live.start_time() + 1);
+        reused.wait_group_gone(Duration::ZERO).unwrap();
+        assert!(live.is_alive());
+        live.kill().unwrap();
     }
 
     #[test]

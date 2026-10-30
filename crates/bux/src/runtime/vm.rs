@@ -684,13 +684,14 @@ impl Vm {
         self.kill()
     }
 
-    /// Kills the VM process.
+    /// Kills the VM's processes and waits until they are gone.
     ///
     /// # Errors
     ///
-    /// Returns an error if the status update fails.
+    /// Returns an error if a process of the VM survives, which leaves the VM's
+    /// state in place, or if the status update fails.
     pub fn kill(&mut self) -> Result<()> {
-        self.state.process().kill().ok();
+        self.state.process().kill()?;
         self.mark_stopped()
     }
 

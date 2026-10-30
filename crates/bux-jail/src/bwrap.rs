@@ -66,7 +66,9 @@ impl Sandbox for BwrapSandbox {
 #[allow(clippy::unwrap_used, reason = "unit tests")]
 mod tests {
     use super::*;
+    use crate::process::live_group_members;
     use std::path::PathBuf;
+    use std::process::Stdio;
 
     fn jail(die_with_parent: bool) -> JailConfig {
         JailConfig {
@@ -103,6 +105,54 @@ mod tests {
             args_contain_die_with_parent(&cmd),
             "foreground jail must pass --die-with-parent"
         );
+    }
+
+    /// `bwrap` if it can create a user namespace on this host.
+    fn usable_bwrap() -> Option<PathBuf> {
+        let bwrap = bux_bwrap::path()?;
+        Command::new(bwrap)
+            .args(["--unshare-pid", "--ro-bind", "/", "/", "--"])
+            .arg(bwrap)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?
+            .success()
+            .then(|| bwrap.to_path_buf())
+    }
+
+    #[test]
+    fn kill_stops_every_process_in_the_jail() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(bwrap) = usable_bwrap() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("shim");
+        std::fs::write(&shim, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config_path = dir.path().join("cfg.json");
+        std::fs::write(&config_path, b"{}").unwrap();
+        let cfg = JailConfig {
+            socks_dir: dir.path().to_path_buf(),
+            bwrap_path: Some(bwrap),
+            ..jail(false)
+        };
+
+        let spawned = crate::spawn(&shim, &config_path, cfg).unwrap();
+        let group = spawned.process.pid();
+
+        // The outer bwrap, the inner bwrap and the shim.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while live_group_members(group) < 3 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(live_group_members(group), 3);
+
+        spawned.process.kill().unwrap();
+        assert_eq!(live_group_members(group), 0);
     }
 
     #[test]
