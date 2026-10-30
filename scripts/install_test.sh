@@ -287,6 +287,18 @@ case "$native" in
     *) fail "host_target not a CD matrix member: $native" ;;
 esac
 
+# musl-tools on a glibc distro adds a musl loader; only a host without the
+# glibc loader is a musl host.
+glibc_ld=/lib64/ld-linux-x86-64.so.2
+musl_ld=/lib/ld-musl-x86_64.so.1
+mkdir -p "$T/root-glibc/lib64" "$T/root-glibc/lib" "$T/root-musl/lib" "$T/root-none"
+: >"$T/root-glibc$glibc_ld"
+: >"$T/root-glibc$musl_ld"
+: >"$T/root-musl$musl_ld"
+musl_host "$glibc_ld" "$musl_ld" "$T/root-glibc" && fail "glibc host with musl-tools must not be musl"
+musl_host "$glibc_ld" "$musl_ld" "$T/root-musl" || fail "host with only a musl loader must be musl"
+musl_host "$glibc_ld" "$musl_ld" "$T/root-none" && fail "host without either loader must not be musl"
+
 mkdir -p "$T/ht"
 write_uname "$T/ht" Linux x86_64
 got=$(PATH="$T/ht:$PATH" host_target)
