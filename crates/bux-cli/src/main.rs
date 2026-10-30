@@ -345,7 +345,7 @@ enum SnapshotAction {
         /// Snapshot ID.
         id: String,
     },
-    /// Restore a snapshot as a new VM (flatten overlay; copies `vcpus`, ram, network, `auto_remove`).
+    /// Restore a snapshot as a new VM (flatten overlay; copies `vcpus`, ram, network, `auto_remove`, security options).
     ///
     /// The restored VM always boots detached, matching `bux clone`. Restore
     /// requires the source VM row: `bux snapshot restore` after `bux rm` of the
