@@ -1,4 +1,4 @@
-//! `bux logs` — show shim stderr for a VM.
+//! `bux logs` — show a VM's log (shim and guest console output).
 
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -35,7 +35,7 @@ pub fn logs(args: &LogsArgs) -> Result<()> {
 
     if !path.exists() {
         anyhow::bail!(
-            "no log file for VM {} at {} (shim may not have written stderr yet)",
+            "no log file for VM {} at {} (shim may not have written it yet)",
             info.id,
             path.display()
         );

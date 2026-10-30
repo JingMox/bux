@@ -1,4 +1,4 @@
-//! `GET /v1/sandboxes/{id}/logs` — shim stderr at [`bux::Vm::log_path`].
+//! `GET /v1/sandboxes/{id}/logs` — the VM log at [`bux::Vm::log_path`].
 
 use std::io;
 
@@ -23,7 +23,7 @@ pub(crate) fn routes() -> Router<AppState> {
     tag = "Sandboxes",
     params(("id" = String, Path, description = "Exact 12-char hex sandbox id")),
     responses(
-        (status = 200, description = "Shim stderr ({socks}/{id}.stderr)", content_type = "text/plain", body = String),
+        (status = 200, description = "VM log ({socks}/{id}.log): shim and guest console output", content_type = "text/plain", body = String),
         (status = 401, description = "Missing or invalid Bearer token"),
         (status = 404, description = "Missing or other tenant")
     )
@@ -34,10 +34,10 @@ pub(crate) async fn logs_one(
     Path(id): Path<String>,
 ) -> Result<String, ApiError> {
     let vm = load_owned(&state.runtime, &tenant.id, &id)?;
-    read_stderr(&vm)
+    read_log(&vm)
 }
 
-fn read_stderr(vm: &Vm) -> Result<String, ApiError> {
+fn read_log(vm: &Vm) -> Result<String, ApiError> {
     match std::fs::read(vm.log_path()) {
         Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(String::new()),
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logs_returns_engine_stderr_file() {
+    async fn logs_returns_engine_log_file() {
         const ID: &str = "abc123aaa021";
         let h = harness();
         plant_vm(h.dir.path(), ID, "tenant1", "a1");
@@ -213,7 +213,7 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::OK, "owner");
-        assert_eq!(text_body(res).await, "shim says hi\n", "stderr");
+        assert_eq!(text_body(res).await, "shim says hi\n", "log");
     }
 
     #[tokio::test]

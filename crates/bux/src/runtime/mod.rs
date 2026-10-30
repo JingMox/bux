@@ -1510,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn abort_unready_keeps_stderr_drops_json_and_row() {
+    fn abort_unready_keeps_log_drops_json_and_row() {
         let dir = tempfile::tempdir().unwrap();
         let rt = Runtime::open(dir.path()).unwrap();
         let id = "abortunready001";
@@ -1525,23 +1525,23 @@ mod tests {
             },
         );
         let sock = rt.socks_dir.join(format!("{id}.sock"));
-        let stderr = sock.with_extension("stderr");
+        let log = sock.with_extension("log");
         let json = sock.with_extension("json");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        fs::write(&stderr, b"shim-and-guest-log").unwrap();
+        fs::write(&log, b"shim-and-guest-log").unwrap();
         fs::write(&json, b"{\"secrets\":true}").unwrap();
 
         rt.get(id).unwrap().abort_unready();
 
-        assert!(stderr.exists(), "create_or_dump needs socks/*.stderr");
-        assert_eq!(fs::read(&stderr).unwrap(), b"shim-and-guest-log");
+        assert!(log.exists(), "create_or_dump needs socks/*.log");
+        assert_eq!(fs::read(&log).unwrap(), b"shim-and-guest-log");
         assert!(!json.exists(), "secrets JSON must not linger on abort");
         assert!(!sock.exists());
         assert!(rt.db.get_by_id_prefix(id).is_err());
     }
 
     #[test]
-    fn mark_stopped_non_auto_remove_unlinks_vsock_sock_keeps_stderr() {
+    fn mark_stopped_non_auto_remove_unlinks_vsock_sock_keeps_log() {
         let dir = tempfile::tempdir().unwrap();
         let rt = Runtime::open(dir.path()).unwrap();
         let id = "stopvsock000001";
@@ -1556,9 +1556,9 @@ mod tests {
             },
         );
         let sock = rt.socks_dir.join(format!("{id}.sock"));
-        let stderr = sock.with_extension("stderr");
+        let log = sock.with_extension("log");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        fs::write(&stderr, b"shim-log").unwrap();
+        fs::write(&log, b"shim-log").unwrap();
 
         rt.get(id).unwrap().kill().unwrap();
 
@@ -1566,7 +1566,7 @@ mod tests {
             !sock.exists(),
             "#109: non-auto_remove stop must unlink {id}.sock"
         );
-        assert!(stderr.exists(), "bux logs after stop");
+        assert!(log.exists(), "bux logs after stop");
         let row = rt.db.get_by_id_prefix(id).unwrap();
         assert_eq!(row.status, Status::Stopped);
     }

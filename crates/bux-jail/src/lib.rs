@@ -130,8 +130,9 @@ pub struct JailConfig {
     /// [`Self::bwrap_path`]), seatbelt on macOS, noop on other Unix.
     /// Explicit [`NoopSandbox`] is the only way to skip the Linux jailer.
     pub sandbox: Option<Box<dyn Sandbox>>,
-    /// File to redirect child stderr to. When `None`, stderr is inherited.
-    pub stderr_file: Option<std::fs::File>,
+    /// Log file for the child's stdout and stderr. When `None`, stdout goes
+    /// to `/dev/null` and stderr is inherited.
+    pub log_file: Option<std::fs::File>,
     /// Request Landlock LSM on Linux (default product: true on Linux).
     ///
     /// When true and the kernel cannot enforce Landlock, spawn fails unless
@@ -191,8 +192,13 @@ pub fn spawn(shim: &Path, config_path: &Path, config: JailConfig) -> Result<Spaw
     cmd.stdin(Stdio::null());
 
     let die_with_parent = config.die_with_parent;
-    if let Some(file) = config.stderr_file {
+    // A detached shim outlives the caller, so it must not keep the caller's
+    // stdout open: `ID=$(bux create ...)` would wait until the VM stops.
+    if let Some(file) = config.log_file {
+        cmd.stdout(Stdio::from(file.try_clone()?));
         cmd.stderr(Stdio::from(file));
+    } else {
+        cmd.stdout(Stdio::null());
     }
 
     let (watchdog_read, keepalive) = if die_with_parent {
@@ -373,7 +379,7 @@ mod tests {
             socks_dir: PathBuf::from("/tmp/bux-socks"),
             virtiofs_paths: vec![],
             sandbox: None,
-            stderr_file: None,
+            log_file: None,
             landlock: false,
             allow_degraded_security: false,
             die_with_parent: true,
@@ -432,6 +438,45 @@ mod tests {
         assert_eq!(
             after, before,
             "BwrapUnavailable must not leak the landlock ruleset fd"
+        );
+    }
+
+    #[test]
+    fn spawn_sends_shim_stdout_to_the_log_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("shim");
+        // Stay alive: a child that exits at once may be gone before spawn
+        // reads its start time.
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\necho to-stdout\necho to-stderr >&2\nexec /bin/sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = dir.path().join("shim.log");
+        let cfg = JailConfig {
+            sandbox: Some(Box::new(NoopSandbox)),
+            log_file: Some(std::fs::File::create(&log).unwrap()),
+            die_with_parent: false,
+            ..jail(None)
+        };
+
+        let spawned = spawn(&shim, &dir.path().join("cfg.json"), cfg).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !std::fs::read_to_string(&log).unwrap().contains("to-stderr")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        spawned.process.kill().unwrap();
+        spawned.process.wait();
+
+        let out = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            out.contains("to-stdout") && out.contains("to-stderr"),
+            "shim stdout and stderr must both go to the log file, got {out:?}"
         );
     }
 

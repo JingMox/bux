@@ -245,10 +245,11 @@ impl Vm {
         &self.state
     }
 
-    /// Shim stderr log path (`{id}.stderr` next to the vsock socket).
+    /// VM log path (`{id}.log` next to the vsock socket): the shim's stdout and
+    /// stderr, which include the guest console.
     #[must_use]
     pub fn log_path(&self) -> PathBuf {
-        self.state.socket.with_extension("stderr")
+        self.state.socket.with_extension("log")
     }
 
     /// Tear down a VM that never became ready (create failure).

@@ -31,8 +31,8 @@ pub(super) fn reject_long_unix_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Last `last_n_lines` of shim stderr, formatted as a death/timeout hint.
-pub(crate) fn stderr_tail(path: &Path, last_n_lines: usize) -> String {
+/// Last `last_n_lines` of the VM log, formatted as a death/timeout hint.
+pub(crate) fn log_tail(path: &Path, last_n_lines: usize) -> String {
     fs::read_to_string(path)
         .ok()
         .filter(|s| !s.is_empty())
@@ -40,7 +40,7 @@ pub(crate) fn stderr_tail(path: &Path, last_n_lines: usize) -> String {
             let total = s.lines().count();
             let skip = total.saturating_sub(last_n_lines);
             let tail: String = s.lines().skip(skip).collect::<Vec<_>>().join("\n");
-            format!("\n  stderr:\n    {}", tail.replace('\n', "\n    "))
+            format!("\n  log:\n    {}", tail.replace('\n', "\n    "))
         })
         .unwrap_or_default()
 }
@@ -54,7 +54,7 @@ pub(crate) fn shim_death_message(pid: u32, exit_file: &Path, status: Option<Exit
         || status.map_or_else(|| "unknown reason".into(), exit_status_detail),
         |info| info.summary(),
     );
-    let hint = stderr_tail(&exit_file.with_extension("stderr"), 5);
+    let hint = log_tail(&exit_file.with_extension("log"), 5);
     format!("VM process (pid {pid}) died before ready: {detail}{hint}")
 }
 
@@ -77,7 +77,7 @@ fn exit_status_detail(status: ExitStatus) -> String {
 
 /// Timeout path: ready wait expired while the jail parent is still alive.
 pub(crate) fn agent_not_ready_message(pid: u32, exit_file: &Path) -> String {
-    let hint = stderr_tail(&exit_file.with_extension("stderr"), 5);
+    let hint = log_tail(&exit_file.with_extension("log"), 5);
     format!("guest agent did not become ready (pid {pid}){hint}")
 }
 
@@ -100,7 +100,7 @@ pub(crate) fn clean_vsock_sock(socket: &Path) {
 /// Removes transient files associated with a VM socket path.
 pub(crate) fn clean_vm_files(socket: &Path) {
     clean_vsock_sock(socket);
-    for ext in ["exit", "json", "stderr"] {
+    for ext in ["exit", "json", "log"] {
         drop(fs::remove_file(socket.with_extension(ext)));
     }
     clean_net_sock(socket);
@@ -108,9 +108,9 @@ pub(crate) fn clean_vm_files(socket: &Path) {
 
 /// Create-failure teardown: drop bind inodes and secrets JSON; keep logs for dump.
 ///
-/// `{id}.stderr` / `{id}.exit` are the only host-visible guest/shim logs.
+/// `{id}.log` / `{id}.exit` are the only host-visible guest/shim logs.
 /// `clean_vm_files` deletes them — that is correct for `remove` / `auto_remove`,
-/// not for abort of an unready create (`create_or_dump` cats `socks/*.stderr`).
+/// not for abort of an unready create (`create_or_dump` cats `socks/*.log`).
 pub(crate) fn clean_unready_files(socket: &Path) {
     clean_vsock_sock(socket);
     drop(fs::remove_file(socket.with_extension("json")));
@@ -236,15 +236,15 @@ mod tests {
     }
 
     #[test]
-    fn clean_unready_files_keeps_stderr_and_exit_unlinks_json() {
+    fn clean_unready_files_keeps_log_and_exit_unlinks_json() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("id.sock");
-        let stderr = sock.with_extension("stderr");
+        let log = sock.with_extension("log");
         let json = sock.with_extension("json");
         let exit = sock.with_extension("exit");
         let net = sock.with_extension("net.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        fs::write(&stderr, b"shim-and-guest-log").unwrap();
+        fs::write(&log, b"shim-and-guest-log").unwrap();
         fs::write(&json, b"{\"secrets\":true}").unwrap();
         fs::write(&exit, b"{}").unwrap();
         let _net = std::os::unix::net::UnixListener::bind(&net).unwrap();
@@ -254,26 +254,26 @@ mod tests {
         assert!(!sock.exists());
         assert!(!json.exists(), "secrets JSON must not linger on abort");
         assert!(!net.exists());
-        assert!(stderr.exists(), "create_or_dump needs socks/*.stderr");
+        assert!(log.exists(), "create_or_dump needs socks/*.log");
         assert!(exit.exists());
-        assert_eq!(fs::read(&stderr).unwrap(), b"shim-and-guest-log");
+        assert_eq!(fs::read(&log).unwrap(), b"shim-and-guest-log");
     }
 
     #[test]
-    fn agent_not_ready_message_includes_stderr_tail() {
+    fn agent_not_ready_message_includes_log_tail() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("id.sock");
-        let stderr = sock.with_extension("stderr");
+        let log = sock.with_extension("log");
         let exit = sock.with_extension("exit");
         let planted = "bux-mitm-ca-write-failed";
-        fs::write(&stderr, format!("line1\nline2\nline3\nline4\n{planted}\n")).unwrap();
+        fs::write(&log, format!("line1\nline2\nline3\nline4\n{planted}\n")).unwrap();
 
         let msg = agent_not_ready_message(4242, &exit);
         assert_ne!(msg, "guest agent did not become ready");
         assert!(msg.contains("guest agent did not become ready"));
         assert!(msg.contains("4242"));
-        assert!(msg.contains("stderr") && msg.contains(planted));
-        assert!(stderr_tail(&stderr, 5).contains(planted));
+        assert!(msg.contains("log:") && msg.contains(planted));
+        assert!(log_tail(&log, 5).contains(planted));
         let death = shim_death_message(4242, &exit, None);
         assert!(death.contains("died before ready"));
         assert!(death.contains("unknown reason"));
@@ -298,14 +298,14 @@ mod tests {
     }
 
     #[test]
-    fn clean_vsock_sock_unlinks_unix_socket_and_keeps_stderr() {
+    fn clean_vsock_sock_unlinks_unix_socket_and_keeps_log() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("id.sock");
-        let stderr = sock.with_extension("stderr");
+        let log = sock.with_extension("log");
         let json = sock.with_extension("json");
         let exit = sock.with_extension("exit");
         let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        fs::write(&stderr, b"keep-me").unwrap();
+        fs::write(&log, b"keep-me").unwrap();
         fs::write(&json, b"{}").unwrap();
         fs::write(&exit, b"{}").unwrap();
 
@@ -315,7 +315,7 @@ mod tests {
             !sock.exists(),
             "non-auto_remove stop must unlink vsock listen path"
         );
-        assert!(stderr.exists(), "bux logs needs id.stderr after stop");
+        assert!(log.exists(), "bux logs needs id.log after stop");
         assert!(json.exists());
         assert!(exit.exists());
     }

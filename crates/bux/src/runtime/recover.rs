@@ -194,7 +194,7 @@ fn terminate(process: ShimProcess, vm_id: &str) {
     }
 }
 
-/// Remove sock/json/stderr files for VMs no longer in the database.
+/// Remove sock/json/log files for VMs no longer in the database.
 fn clean_orphan_socks(socks_dir: &Path, known_ids: &HashSet<String>) -> u32 {
     let Ok(entries) = fs::read_dir(socks_dir) else {
         return 0;
@@ -217,7 +217,7 @@ fn sock_entry_is_orphan(name: &std::ffi::OsStr, known_ids: &HashSet<String>) -> 
     if let Some(id) = name_str.strip_suffix(".net.sock") {
         return !known_ids.contains(id);
     }
-    for ext in [".sock", ".exit", ".json", ".stderr"] {
+    for ext in [".sock", ".exit", ".json", ".log"] {
         if let Some(id) = name_str.strip_suffix(ext)
             && !known_ids.contains(id)
         {

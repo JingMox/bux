@@ -73,7 +73,7 @@ enum Command {
     /// Execute a command in a running VM.
     Exec(vm::ExecArgs),
 
-    /// Show shim stderr logs for a VM.
+    /// Show a VM's log (shim and guest console output).
     Logs(logs::LogsArgs),
 
     /// List VMs.
