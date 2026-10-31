@@ -33,8 +33,8 @@ impl Sandbox for BwrapSandbox {
             builder = builder.dev_bind("/dev/kvm", "/dev/kvm");
         }
 
-        // The tmpfs above may hide them. Before the writable binds: a read-only
-        // directory here must not cover a writable path beneath it.
+        // After the tmpfs mounts, which may hide these paths, and before the
+        // writable binds, which a read-only directory must not cover.
         for path in &jail.readonly_paths {
             builder = builder.ro_bind(path, path);
         }
