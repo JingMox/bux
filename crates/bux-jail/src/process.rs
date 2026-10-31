@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{WaitStatus, waitpid};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, pipe};
 
 /// How long [`ShimProcess::kill`] waits for the killed processes to be gone.
@@ -102,7 +102,7 @@ impl ShimProcess {
             if stat.state != 'Z' || stat.start_time != self.start_time {
                 return None;
             }
-            match waitpid(self.nix_pid(), Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            match waitpid(self.nix_pid(), Some(WaitPidFlag::WNOHANG)) {
                 Ok(WaitStatus::Exited(_, code)) => Some(ExitStatus::from_raw((code & 0xff) << 8)),
                 Ok(WaitStatus::Signaled(_, signal, core)) => Some(ExitStatus::from_raw(
                     signal as i32 | if core { 0x80 } else { 0 },
@@ -122,19 +122,27 @@ impl ShimProcess {
     ///
     /// Returns the OS error if the signal cannot be delivered.
     pub fn terminate(self) -> io::Result<()> {
-        self.send_if_alive(Signal::SIGTERM)
+        if self.is_alive() {
+            self.deliver(Signal::SIGTERM)?;
+        }
+        Ok(())
     }
 
     /// Kill the process group (`SIGKILL`) and wait until none of it is left,
     /// up to 10 s. A process that is gone is not an error.
+    ///
+    /// This blocks the calling thread, so async code runs it on a blocking one.
     ///
     /// # Errors
     ///
     /// Returns the OS error if the signal cannot be delivered, and
     /// [`io::ErrorKind::TimedOut`] if a process of the group is still alive.
     pub fn kill(self) -> io::Result<()> {
-        self.send_if_alive(Signal::SIGKILL)?;
-        self.wait_group_gone(KILL_WAIT)
+        let identified = self.is_alive();
+        if identified {
+            self.deliver(Signal::SIGKILL)?;
+        }
+        self.wait_group_gone(identified, KILL_WAIT)
     }
 
     /// Send the POSIX signal number `sig` to the process group.
@@ -148,7 +156,7 @@ impl ShimProcess {
         if !self.is_alive() {
             return Err(Errno::ESRCH.into());
         }
-        signal::killpg(self.nix_pid(), sig).map_err(io::Error::from)
+        self.killpg(sig).map_err(io::Error::from)
     }
 
     /// Block until the process exits.
@@ -159,7 +167,13 @@ impl ShimProcess {
         reason = "blocking wait runs on a blocking thread, not in async code"
     )]
     pub fn wait(self) {
-        if self.try_reap().is_some() || !self.is_alive() {
+        if self.try_reap().is_some() {
+            return;
+        }
+        if !self.is_alive() {
+            // macOS cannot look up a zombie, so an exited child may still need reaping.
+            #[cfg(not(target_os = "linux"))]
+            let _reaped = waitpid(self.nix_pid(), Some(WaitPidFlag::WNOHANG));
             return;
         }
         if let Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) = waitpid(self.nix_pid(), None)
@@ -171,28 +185,33 @@ impl ShimProcess {
         }
     }
 
-    /// Deliver `sig` to the group unless the pid no longer belongs to this process.
-    fn send_if_alive(self, sig: Signal) -> io::Result<()> {
-        if !self.is_alive() {
-            return Ok(());
-        }
-        match signal::killpg(self.nix_pid(), sig) {
+    /// Deliver `sig` to the group. A group that is gone is not an error.
+    fn deliver(self, sig: Signal) -> io::Result<()> {
+        match self.killpg(sig) {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// Poll until no process of the group is alive, reaping this process if it
-    /// is a child of this process.
+    /// `killpg`, with the `EPERM` macOS returns for a group of only zombies
+    /// reported as `ESRCH`.
+    fn killpg(self, sig: Signal) -> nix::Result<()> {
+        match signal::killpg(self.nix_pid(), sig) {
+            #[cfg(not(target_os = "linux"))]
+            Err(Errno::EPERM) if !self.is_alive() => Err(Errno::ESRCH),
+            result => result,
+        }
+    }
+
+    /// Poll until no process of the group is alive.
     #[allow(
         clippy::disallowed_methods,
-        reason = "blocking wait runs on a blocking path; SIGKILL makes it short"
+        reason = "blocks its thread; `Vm` runs it on a blocking one, and the error-path teardowns accept the wait"
     )]
-    fn wait_group_gone(self, timeout: Duration) -> io::Result<()> {
+    fn wait_group_gone(self, identified: bool, timeout: Duration) -> io::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            self.reap_if_exited();
-            if !self.group_alive() {
+            if self.group_gone(identified) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -209,36 +228,35 @@ impl ShimProcess {
         }
     }
 
-    /// Reap this process if it is an exited child of this process.
-    fn reap_if_exited(self) {
-        #[cfg(target_os = "linux")]
-        let _reaped = self.try_reap();
-        // macOS still reports a zombie's start time, so `is_alive` vouches for the pid.
-        #[cfg(not(target_os = "linux"))]
-        if self.is_alive() {
-            let _reaped = waitpid(self.nix_pid(), Some(nix::sys::wait::WaitPidFlag::WNOHANG));
-        }
-    }
-
-    /// `true` while a process of the group is alive; zombies do not count.
+    /// `true` once no process of the group is alive, reaping this process if it
+    /// is an exited child of this process. Zombies do not count.
     ///
     /// A group keeps its id reserved as a pid until its last process is gone. So
     /// another process with this pid means the group is gone, and a pid that
     /// no process holds can still name a group whose leader was killed alone.
     #[cfg(target_os = "linux")]
-    fn group_alive(self) -> bool {
+    fn group_gone(self, _identified: bool) -> bool {
+        let _reaped = self.try_reap();
         match stat(self.pid) {
-            Some(stat) if stat.start_time != self.start_time => false,
-            Some(stat) if !matches!(stat.state, 'Z' | 'X') => true,
-            _ => live_group_members(self.pid) > 0,
+            Some(stat) if stat.start_time != self.start_time => true,
+            Some(stat) if !matches!(stat.state, 'Z' | 'X') => false,
+            _ => live_group_members(self.pid) == 0,
         }
     }
 
-    /// `true` while the process is alive. On macOS the group is the shim alone:
-    /// `sandbox-exec` execs it in place.
+    /// `true` once the process is gone, reaping it if it is a child of this
+    /// process. On macOS the group is the shim alone: `sandbox-exec` execs it in
+    /// place.
+    ///
+    /// macOS cannot look up a zombie, so only a pid `identified` before the signal
+    /// is known to be this process when `waitpid` finds it running.
     #[cfg(not(target_os = "linux"))]
-    fn group_alive(self) -> bool {
-        self.is_alive()
+    fn group_gone(self, identified: bool) -> bool {
+        match waitpid(self.nix_pid(), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => !identified,
+            Ok(_) => true,
+            Err(_) => !self.is_alive(),
+        }
     }
 
     /// pid as a `nix` [`Pid`].
@@ -377,7 +395,6 @@ mod tests {
 
     /// A `/bin/sh -c` group leader that runs `script` once its stdin closes,
     /// identified while it is still running.
-    #[cfg(target_os = "linux")]
     fn exiting_child(script: &str) -> (Child, ShimProcess) {
         let child = Command::new("/bin/sh")
             .args(["-c", &format!("read _; {script}")])
@@ -387,6 +404,47 @@ mod tests {
             .unwrap();
         let process = ShimProcess::from_pid(child.id()).unwrap();
         (child, process)
+    }
+
+    /// Check that `process`, a child of this process, leaves no zombie: `waitpid`
+    /// only fails for a child that has been reaped.
+    fn assert_reaped(process: ShimProcess) {
+        assert_eq!(
+            waitpid(process.nix_pid(), Some(WaitPidFlag::WNOHANG)),
+            Err(Errno::ECHILD),
+            "a zombie is left"
+        );
+    }
+
+    #[test]
+    fn kill_reaps_a_child() {
+        let (_child, process) = sleep_child();
+        process.kill().unwrap();
+        assert_reaped(process);
+    }
+
+    /// macOS: a zombie cannot be looked up, `killpg` on it returns `EPERM`, and
+    /// only `waitpid` removes it. The sleep lets the exit finish.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "no way to observe a macOS zombie"
+    )]
+    fn a_zombie_counts_as_gone_and_wait_reaps_it() {
+        let (mut child, process) = exiting_child("exit 0");
+        drop(child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process.is_alive() {
+            assert!(Instant::now() < deadline, "the child did not exit");
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+
+        assert_eq!(process.killpg(Signal::SIGTERM), Err(Errno::ESRCH));
+        process.terminate().unwrap();
+        process.kill().unwrap();
+        assert_reaped(process);
     }
 
     /// Block until `pid` has exited and is a zombie.
