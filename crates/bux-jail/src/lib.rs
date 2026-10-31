@@ -513,27 +513,28 @@ mod tests {
         );
     }
 
-    /// Shim script that lists its FDs (bwrap's `/proc` is the host's, so
+    /// Script that lists its FDs (bwrap's `/proc` is the host's, so
     /// `/proc/self`, not `$$`), then stays alive long enough for `spawn` to
     /// read its start time.
     #[cfg(target_os = "linux")]
-    fn fd_listing_shim(dir: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
-        let shim = dir.join("shim");
+    fn fd_listing_script(dir: &Path) -> PathBuf {
+        let script = dir.join("cfg.sh");
         std::fs::write(
-            &shim,
-            "#!/bin/sh\nls -l /proc/self/fd\necho listed\nexec /bin/sleep 3\n",
+            &script,
+            "ls -l /proc/self/fd\necho listed\nexec /bin/sleep 3\n",
         )
         .unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        shim
+        script
     }
 
-    /// Spawn `shim`, wait for its FD listing, and return the log.
+    /// Spawn `sh` as the shim, wait for the FD listing of `script`, and return the log.
+    ///
+    /// `sh` reads the config path as its script. A file this process just wrote can
+    /// fail to `exec` with `ETXTBSY`: a test forking in parallel inherits the
+    /// descriptor.
     #[cfg(target_os = "linux")]
-    fn fd_listing(shim: &Path, config_path: &Path, log: &Path, cfg: JailConfig) -> String {
-        let spawned = spawn(shim, config_path, cfg).unwrap();
+    fn fd_listing(script: &Path, log: &Path, cfg: JailConfig) -> String {
+        let spawned = spawn(Path::new("/bin/sh"), script, cfg).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !std::fs::read_to_string(log).unwrap().contains("listed")
             && std::time::Instant::now() < deadline
@@ -552,7 +553,7 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let shim = fd_listing_shim(dir.path());
+        let script = fd_listing_script(dir.path());
         let log = dir.path().join("shim.log");
         let _inheritable = nix::unistd::pipe().unwrap();
         let cfg = JailConfig {
@@ -563,7 +564,7 @@ mod tests {
             ..jail(None)
         };
 
-        let out = fd_listing(&shim, &dir.path().join("cfg.json"), &log, cfg);
+        let out = fd_listing(&script, &log, cfg);
 
         assert!(
             out.contains("anon_inode:[landlock-ruleset]"),
@@ -601,10 +602,8 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
-        let shim = fd_listing_shim(dir.path());
+        let script = fd_listing_script(dir.path());
         let log = dir.path().join("shim.log");
-        let config_path = dir.path().join("cfg.json");
-        std::fs::write(&config_path, b"{}").unwrap();
         let cfg = JailConfig {
             socks_dir: dir.path().to_path_buf(),
             log_file: Some(std::fs::File::create(&log).unwrap()),
@@ -613,7 +612,7 @@ mod tests {
             ..jail(Some(bwrap))
         };
 
-        let out = fd_listing(&shim, &config_path, &log, cfg);
+        let out = fd_listing(&script, &log, cfg);
 
         assert!(
             out.contains("anon_inode:[landlock-ruleset]"),
