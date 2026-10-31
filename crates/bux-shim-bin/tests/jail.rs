@@ -1,4 +1,4 @@
-//! A jailed shim dies with bwrap's outer process, the pid bux records for the VM.
+//! A jailed shim dies with bwrap's outer process.
 
 #![allow(
     unused_crate_dependencies,

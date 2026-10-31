@@ -192,7 +192,7 @@ pub fn spawn(shim: &Path, config_path: &Path, config: JailConfig) -> Result<Spaw
         unsafe { OwnedFd::from_raw_fd(fd) }
     });
     cmd.stdin(Stdio::null());
-    // The processes of the jail share this group, so `ShimProcess` reaches them all.
+    // The jail's processes share one group, which `ShimProcess` signals.
     cmd.process_group(0);
 
     let die_with_parent = config.die_with_parent;

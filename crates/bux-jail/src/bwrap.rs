@@ -46,8 +46,8 @@ impl Sandbox for BwrapSandbox {
         }
         builder = builder.ro_bind(config_path, config_path);
 
-        // The shim is PID 1 with bwrap's outer process as its parent, so it can
-        // die with that process, the one bux records (see the shim's watchdog).
+        // Without bwrap's reaper, the outer process is the shim's parent, and the
+        // shim dies with it (`bux_shim::start_watchdog_thread`).
         Some(
             builder
                 .run_as_pid_1()

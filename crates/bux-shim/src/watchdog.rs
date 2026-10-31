@@ -106,10 +106,9 @@ pub fn start_watchdog_thread() {
 
 /// Die with bwrap's outer process when this shim is PID 1 of a jail.
 ///
-/// That process is the pid bux records for the VM: once it is gone, bux treats
-/// the VM as stopped, so the VM must really stop. bwrap's `--die-with-parent`
-/// cannot do this for a detached VM, because it also ties the outer process to
-/// the caller, which exits.
+/// The outer process is the one recorded for the VM, and the VM must not outlive
+/// it. bwrap's `--die-with-parent` would also tie it to the caller, which a
+/// detached VM outlives.
 #[cfg(target_os = "linux")]
 fn die_with_jail() {
     if std::process::id() != 1 {

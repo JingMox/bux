@@ -5,10 +5,9 @@
 //! pairs the pid with the process start time and treats a pid whose start
 //! time differs as a process that is gone.
 //!
-//! With a jail, the recorded process is not the shim but bwrap's outer process,
-//! and the shim is PID 1 of the new namespace. `spawn` makes the recorded process
-//! a process group leader, the shim inherits the group, and signals go to the
-//! group.
+//! With a jail, the recorded process is bwrap's outer process and the shim is
+//! PID 1 of the new namespace. Both are in the process group that
+//! [`spawn`](crate::spawn) creates, and signals go to that group.
 
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
