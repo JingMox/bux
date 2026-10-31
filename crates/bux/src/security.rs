@@ -226,14 +226,12 @@ mod tests {
         reason = "env lock must outlive probe"
     )]
     fn probe_namespaces_uses_engine_bwrap_lookup() {
-        use std::os::unix::fs::PermissionsExt;
-
         let mut env = crate::guest::sidecar_env::lock();
         crate::bwrap::forget_working();
         let empty = tempfile::tempdir().unwrap();
         env.set("PATH", empty.path());
-        let planted = crate::guest::sidecar_env::Planted::sibling("bwrap", b"#!/bin/sh\nexit 0\n");
-        std::fs::set_permissions(planted.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let planted = crate::guest::sidecar_env::Planted::sibling("bwrap", b"");
+        crate::bwrap::fake_bwrap(planted.path(), "exit 0");
         assert!(
             !bux_jail::checks::check_host().namespaces,
             "PATH-only which(bwrap) must miss when PATH is empty"
@@ -264,17 +262,12 @@ mod tests {
         reason = "env lock must outlive probe"
     )]
     fn probe_reports_a_bwrap_that_does_not_work() {
-        use std::os::unix::fs::PermissionsExt;
-
         let mut env = crate::guest::sidecar_env::lock();
         crate::bwrap::forget_working();
         let empty = tempfile::tempdir().unwrap();
         env.set("PATH", empty.path());
-        let planted = crate::guest::sidecar_env::Planted::sibling(
-            "bwrap",
-            b"#!/bin/sh\necho denied-by-policy >&2\nexit 1\n",
-        );
-        std::fs::set_permissions(planted.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let planted = crate::guest::sidecar_env::Planted::sibling("bwrap", b"");
+        crate::bwrap::fake_bwrap(planted.path(), "echo denied-by-policy >&2; exit 1");
 
         let h = HostInfo::probe();
 

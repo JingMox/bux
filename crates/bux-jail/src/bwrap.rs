@@ -128,17 +128,26 @@ mod tests {
     }
 
     /// A fake `bwrap` in `dir`: appends its arguments to `args`, then runs `body`.
+    ///
+    /// A child creates the file. `exec` fails with `ETXTBSY` while any process holds
+    /// the file open for writing, and a test forking in parallel inherits this
+    /// process's descriptors.
     fn fake_bwrap(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         let bwrap = dir.join("bwrap");
-        let args = dir.join("args");
-        std::fs::write(
-            &bwrap,
-            format!("#!/bin/sh\necho \"$@\" >> {}\n{body}\n", args.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bwrap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> {}\n{body}\n",
+            dir.join("args").display()
+        );
+        let status = Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"rm -f "$0" && printf %s "$1" > "$0" && chmod 755 "$0""#,
+            ])
+            .arg(&bwrap)
+            .arg(script)
+            .status()
+            .unwrap();
+        assert!(status.success());
         bwrap
     }
 

@@ -100,6 +100,27 @@ pub(crate) fn forget_working() {
     working().clear();
 }
 
+/// Make a fake `bwrap` at `path` that runs `body`.
+///
+/// A child creates the file. `exec` fails with `ETXTBSY` while any process holds
+/// the file open for writing, and a test forking in parallel inherits this
+/// process's descriptors.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "test helper")]
+pub(crate) fn fake_bwrap(path: &Path, body: &str) {
+    let status = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"rm -f "$0" && printf %s "$1" > "$0" && chmod 755 "$0""#,
+        ])
+        .arg(path)
+        .arg(format!("#!/bin/sh\n{body}\n"))
+        .env("PATH", "/usr/bin:/bin")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 /// What decides the advice for a host where no `bwrap` works.
 #[derive(Debug, Clone, Copy)]
 #[allow(
@@ -188,16 +209,8 @@ fn advice(host: Host) -> Vec<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "unit tests")]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
     use crate::guest::sidecar_env;
-
-    /// Make a fake `bwrap` at `path` that runs `body`.
-    fn fake_bwrap(path: &Path, body: &str) {
-        fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
 
     const HOST: Host = Host {
         apparmor_restricts_userns: true,
