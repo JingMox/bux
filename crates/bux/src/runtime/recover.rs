@@ -178,7 +178,9 @@ fn terminate(process: ShimProcess, vm_id: &str) {
     if !process.is_alive() {
         return;
     }
-    process.terminate().ok();
+    if let Err(e) = process.terminate() {
+        warn!(vm_id, error = %e, "failed to terminate VM");
+    }
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(5);
     while process.is_alive() && start.elapsed() < timeout {
@@ -190,7 +192,9 @@ fn terminate(process: ShimProcess, vm_id: &str) {
             pid = process.pid(),
             "kill after recovery/stop timeout"
         );
-        process.kill().ok();
+        if let Err(e) = process.kill() {
+            warn!(vm_id, error = %e, "failed to kill VM");
+        }
     }
 }
 
