@@ -258,13 +258,12 @@ mod tests {
 
         let err = select().unwrap_err();
         assert!(err.starts_with("jailer unavailable"), "{err}");
+        let real_on_path = fs::canonicalize(&on_path).unwrap();
         assert!(
-            err.contains(&format!(
-                "{}: denied-on-path",
-                fs::canonicalize(&on_path).unwrap().display()
-            )),
+            err.contains(&format!("{}: ", real_on_path.display())),
             "{err}"
         );
+        assert!(err.contains("denied-on-path"), "{err}");
         assert!(err.contains("denied-bundled"), "{err}");
         assert!(err.contains("--no-jailer"), "{err}");
     }
