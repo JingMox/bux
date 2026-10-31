@@ -178,11 +178,13 @@ fn advice(host: Host) -> Vec<String> {
             lines.push(format!(
                 "Ubuntu 25.04 and later ship a profile for {SYSTEM_BWRAP}. To install it on this release (once, needs sudo):"
             ));
-            lines.push(format!("  curl -fsSLO {PROFILE_URL}"));
+            lines.push(format!("  curl -fsSLO {PROFILE_URL} &&"));
             lines.push(format!(
-                "  echo \"{PROFILE_SHA256}  bwrap-userns-restrict\" | sha256sum -c"
+                "  echo \"{PROFILE_SHA256}  bwrap-userns-restrict\" | sha256sum -c &&"
             ));
-            lines.push("  sudo install -m 0644 bwrap-userns-restrict /etc/apparmor.d/".to_owned());
+            lines.push(
+                "  sudo install -m 0644 bwrap-userns-restrict /etc/apparmor.d/ &&".to_owned(),
+            );
             lines.push(format!("  sudo apparmor_parser -r {PROFILE_PATH}"));
         } else if host.system_bwrap {
             lines.push(format!(
@@ -350,6 +352,23 @@ mod tests {
         assert!(advice.contains("sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict"));
         assert!(!advice.contains("apt install"), "{advice}");
         assert!(advice.contains("--no-jailer"));
+    }
+
+    #[test]
+    fn the_profile_install_stops_at_the_first_failing_step() {
+        let advice = advice(HOST);
+        let first = advice
+            .iter()
+            .position(|line| line.contains("curl -fsSLO"))
+            .unwrap();
+        let last = advice
+            .iter()
+            .position(|line| line.contains("apparmor_parser -r"))
+            .unwrap();
+        assert_eq!(last - first, 3, "{advice:?}");
+        for line in &advice[first..last] {
+            assert!(line.ends_with(" &&"), "{line}");
+        }
     }
 
     #[test]

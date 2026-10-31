@@ -34,9 +34,9 @@ Ubuntu sets `kernel.apparmor_restrict_unprivileged_userns=1`: a process can crea
 This is upstream AppArmor's own profile, byte-identical to the file Ubuntu 25.04 and 25.10 enable. bux prints these commands but never runs them: system security policy is the administrator's decision, and it needs `sudo`.
 
 ```sh
-curl -fsSLO https://gitlab.com/apparmor/apparmor/-/raw/v4.1.0/profiles/apparmor/profiles/extras/bwrap-userns-restrict
-echo "634d3d3427c483f123cb5ed53b71ea13040187e07d9f67ca74421d42a6170f0e  bwrap-userns-restrict" | sha256sum -c
-sudo install -m 0644 bwrap-userns-restrict /etc/apparmor.d/
+curl -fsSLO https://gitlab.com/apparmor/apparmor/-/raw/v4.1.0/profiles/apparmor/profiles/extras/bwrap-userns-restrict &&
+echo "634d3d3427c483f123cb5ed53b71ea13040187e07d9f67ca74421d42a6170f0e  bwrap-userns-restrict" | sha256sum -c &&
+sudo install -m 0644 bwrap-userns-restrict /etc/apparmor.d/ &&
 sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
 ```
 
