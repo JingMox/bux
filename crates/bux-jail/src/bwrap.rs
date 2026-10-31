@@ -132,24 +132,22 @@ mod tests {
 
     #[test]
     fn kill_stops_every_process_in_the_jail() {
-        use std::os::unix::fs::PermissionsExt;
-
         let Some(bwrap) = usable_bwrap() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
-        let shim = dir.path().join("shim");
-        std::fs::write(&shim, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let config_path = dir.path().join("cfg.json");
-        std::fs::write(&config_path, b"{}").unwrap();
+        let script = dir.path().join("cfg.sh");
+        std::fs::write(&script, "exec /bin/sleep 30\n").unwrap();
         let cfg = JailConfig {
             socks_dir: dir.path().to_path_buf(),
             bwrap_path: Some(bwrap),
             ..jail(false)
         };
 
-        let spawned = crate::spawn(&shim, &config_path, cfg).unwrap();
+        // The shim is `sh`, which reads the config path as its script. A file this
+        // process just wrote can fail to `exec` with `ETXTBSY`: a test forking in
+        // parallel inherits the descriptor.
+        let spawned = crate::spawn(Path::new("/bin/sh"), &script, cfg).unwrap();
         let group = spawned.process.pid();
 
         // bwrap's outer process and the shim.
