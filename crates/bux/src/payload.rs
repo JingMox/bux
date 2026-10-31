@@ -170,7 +170,8 @@ fn take_product_members(
 
 #[allow(
     clippy::unnecessary_wraps,
-    reason = "Linux jailer without a usable bwrap is Err; other platforms always Ok"
+    clippy::missing_const_for_fn,
+    reason = "on Linux this probes bwrap and can fail; other platforms always return Ok"
 )]
 fn require_bwrap(jailer: bool) -> Result<Option<PathBuf>> {
     #[cfg(target_os = "linux")]
