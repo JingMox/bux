@@ -4,8 +4,8 @@
 //! 1. **Die with parent** — `PR_SET_PDEATHSIG(SIGKILL)` (Linux), when requested.
 //! 2. **FD cleanup** — inherited FDs ≥ 3 become close-on-exec, except preserved ones.
 //!
-//! FDs are marked, not closed: std's `Command::spawn` reports an `exec` failure
-//! through a close-on-exec pipe, which has to stay open until `exec`.
+//! Marking instead of closing keeps open the close-on-exec pipe through which
+//! std's `Command::spawn` reports an `exec` failure.
 
 #![allow(
     unsafe_code,
