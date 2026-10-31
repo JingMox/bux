@@ -94,18 +94,30 @@ fn path_restrictions(jail: &JailConfig, shim: &Path, config_path: &Path) -> Path
     r
 }
 
-/// Allow reading what `files` resolve to, and the directory holding it.
+/// Allow reading what `files` resolve to.
 ///
 /// Landlock checks a symlink's target, and `/etc/resolv.conf` usually points out
 /// of `/etc` (systemd-resolved, `NetworkManager`). These daemons replace the file
-/// by rename, and a rule stays on the old inode, so the directory is allowed too.
+/// by rename, and a rule stays on the old inode, so a directory of their own is
+/// allowed too.
 fn allow_symlink_targets(mut r: PathRestrictions, files: &[&str]) -> PathRestrictions {
     for file in files {
         if let Ok(target) = std::fs::canonicalize(file) {
-            r = allow_path_and_parent(r, &target, true);
+            let own_dir = target.parent().is_some_and(is_daemon_dir);
+            r = if own_dir {
+                allow_path_and_parent(r, &target, true)
+            } else {
+                r.allow_read(target)
+            };
         }
     }
     r
+}
+
+/// A subdirectory of `/run` that belongs to a daemon. `/run` itself and
+/// `/run/user` hold other programs' files, such as session sockets.
+fn is_daemon_dir(dir: &Path) -> bool {
+    dir.starts_with("/run") && dir != Path::new("/run") && !dir.starts_with("/run/user")
 }
 
 /// Grant `/dev` read/traverse and RW only on listed leaves that exist.
@@ -214,7 +226,21 @@ mod tests {
     }
 
     #[test]
-    fn symlink_targets_and_their_directory_are_readable() {
+    fn a_daemon_directory_is_a_subdirectory_of_run() {
+        for dir in [
+            "/run/systemd/resolve",
+            "/run/NetworkManager",
+            "/run/resolvconf",
+        ] {
+            assert!(is_daemon_dir(Path::new(dir)), "{dir}");
+        }
+        for dir in ["/run", "/run/user/1000", "/etc", "/home/me", "/"] {
+            assert!(!is_daemon_dir(Path::new(dir)), "{dir}");
+        }
+    }
+
+    #[test]
+    fn only_the_symlink_target_is_readable_outside_a_daemon_directory() {
         let dir = tempfile::tempdir().unwrap();
         let run = dir.path().canonicalize().unwrap().join("run");
         std::fs::create_dir(&run).unwrap();
@@ -228,7 +254,7 @@ mod tests {
             &[link.to_str().unwrap(), "/nonexistent/resolv.conf"],
         );
 
-        assert_eq!(r.read_paths(), [target, run]);
+        assert_eq!(r.read_paths(), [target]);
         assert!(r.read_write_paths().is_empty());
     }
 
