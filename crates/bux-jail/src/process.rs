@@ -575,13 +575,13 @@ mod tests {
         drop(leader.wait());
 
         let err = process
-            .wait_group_gone(Duration::from_millis(50))
+            .wait_group_gone(true, Duration::from_millis(50))
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
 
         drop(member.kill());
         drop(member.wait());
-        process.wait_group_gone(KILL_WAIT).unwrap();
+        process.wait_group_gone(true, KILL_WAIT).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -589,7 +589,7 @@ mod tests {
     fn a_reused_pid_means_the_group_is_gone() {
         let (_child, live) = exiting_child("");
         let reused = ShimProcess::open(live.pid(), live.start_time() + 1);
-        reused.wait_group_gone(Duration::ZERO).unwrap();
+        reused.wait_group_gone(true, Duration::ZERO).unwrap();
         assert!(live.is_alive());
         live.kill().unwrap();
     }

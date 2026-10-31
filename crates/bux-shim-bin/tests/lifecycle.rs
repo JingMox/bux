@@ -26,13 +26,8 @@ fn fifo_config(name: &str) -> (PathBuf, PathBuf) {
     fs::create_dir_all(&dir).unwrap();
     let config = dir.join("cfg.json");
     drop(fs::remove_file(&config));
-    assert!(
-        Command::new("mkfifo")
-            .arg(&config)
-            .status()
-            .unwrap()
-            .success()
-    );
+    let mkfifo = Command::new("mkfifo").arg(&config).status().unwrap();
+    assert!(mkfifo.success(), "{mkfifo}");
     (dir, config)
 }
 
@@ -40,22 +35,17 @@ fn fifo_config(name: &str) -> (PathBuf, PathBuf) {
 /// which it does after installing its signal handlers.
 fn open_for_writing(fifo: &Path) -> File {
     let path = fifo.to_path_buf();
-    let (opened, result) = mpsc::channel();
-    std::thread::spawn(move || opened.send(OpenOptions::new().write(true).open(path)));
-    result
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the shim did not open its config")
-        .unwrap()
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || sender.send(OpenOptions::new().write(true).open(path)));
+    let Ok(opened) = receiver.recv_timeout(Duration::from_secs(10)) else {
+        panic!("the shim did not open its config");
+    };
+    opened.unwrap()
 }
 
 fn send_abort(pid: &str) {
-    assert!(
-        Command::new("kill")
-            .args(["-ABRT", pid])
-            .status()
-            .unwrap()
-            .success()
-    );
+    let kill = Command::new("kill").args(["-ABRT", pid]).status().unwrap();
+    assert!(kill.success(), "{kill}");
 }
 
 #[test]
