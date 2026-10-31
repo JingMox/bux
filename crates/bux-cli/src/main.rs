@@ -118,7 +118,7 @@ enum Command {
         action: SnapshotAction,
     },
 
-    /// Disk-clone a VM (overlay flatten; copies `vcpus`, ram, network, `auto_remove`).
+    /// Disk-clone a VM (overlay flatten; copies `vcpus`, ram, network, `auto_remove`, security options).
     ///
     /// The clone always boots detached and survives CLI exit, matching `bux create`.
     Clone(vm::CloneArgs),
