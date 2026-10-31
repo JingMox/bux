@@ -64,15 +64,11 @@ fn parent_gone(fd: BorrowedFd<'_>, revents: nix::poll::PollFlags, buf: &mut [u8]
     }
 }
 
-/// Tie the process to what it must not outlive: the jail's outer process, and
-/// with `BUX_WATCHDOG_FD` the parent Runtime, through a background thread.
+/// Spawn a background thread that exits the process when the parent dies.
 ///
-/// The thread is not started when `BUX_WATCHDOG_FD` is unset (detach mode).
+/// No-op when `BUX_WATCHDOG_FD` is unset (detach mode).
 #[cfg(unix)]
 pub fn start_watchdog_thread() {
-    #[cfg(target_os = "linux")]
-    die_with_jail();
-
     let Ok(fd_str) = std::env::var(ENV_WATCHDOG_FD) else {
         return;
     };
@@ -104,19 +100,24 @@ pub fn start_watchdog_thread() {
     }
 }
 
-/// Die with bwrap's outer process when this shim is PID 1 of a jail.
+/// Die with bwrap's outer process when this shim is PID 1 of a jail. Call first
+/// thing in `main`: the setting survives `exec`.
 ///
 /// The outer process is the one recorded for the VM, and the VM must not outlive
 /// it. bwrap's `--die-with-parent` would also tie it to the caller, which a
 /// detached VM outlives.
+///
+/// # Errors
+///
+/// Returns the OS error if the kernel refuses. The shim must not continue: it
+/// could outlive the jail.
 #[cfg(target_os = "linux")]
-fn die_with_jail() {
+pub fn die_with_jail() -> crate::Result<()> {
     if std::process::id() != 1 {
-        return;
+        return Ok(());
     }
-    if let Err(e) = nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL) {
-        eprintln!("[bux-shim] failed to tie the shim to its jail: {e}");
-    }
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL)
+        .map_err(|e| std::io::Error::from(e).into())
 }
 
 #[cfg(test)]

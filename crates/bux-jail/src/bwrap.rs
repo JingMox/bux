@@ -47,7 +47,7 @@ impl Sandbox for BwrapSandbox {
         builder = builder.ro_bind(config_path, config_path);
 
         // Without bwrap's reaper, the outer process is the shim's parent, and the
-        // shim dies with it (`bux_shim::start_watchdog_thread`).
+        // shim dies with it (`bux_shim::die_with_jail`).
         Some(
             builder
                 .run_as_pid_1()
@@ -70,13 +70,28 @@ impl Sandbox for BwrapSandbox {
     }
 }
 
+/// `bwrap` if it can create a user namespace on this host.
+#[cfg(test)]
+pub(crate) fn usable_bwrap() -> Option<std::path::PathBuf> {
+    let bwrap = bux_bwrap::path()?;
+    Command::new(bwrap)
+        .args(["--unshare-pid", "--ro-bind", "/", "/", "--"])
+        .arg(bwrap)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?
+        .success()
+        .then(|| bwrap.to_path_buf())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, reason = "unit tests")]
 mod tests {
     use super::*;
     use crate::process::live_group_members;
     use std::path::PathBuf;
-    use std::process::Stdio;
 
     fn jail(die_with_parent: bool) -> JailConfig {
         JailConfig {
@@ -113,21 +128,6 @@ mod tests {
             args_contain_die_with_parent(&cmd),
             "foreground jail must pass --die-with-parent"
         );
-    }
-
-    /// `bwrap` if it can create a user namespace on this host.
-    fn usable_bwrap() -> Option<PathBuf> {
-        let bwrap = bux_bwrap::path()?;
-        Command::new(bwrap)
-            .args(["--unshare-pid", "--ro-bind", "/", "/", "--"])
-            .arg(bwrap)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .ok()?
-            .success()
-            .then(|| bwrap.to_path_buf())
     }
 
     #[test]

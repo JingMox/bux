@@ -21,4 +21,6 @@ pub use config::{
 pub use crash::{install_crash_capture, write_exit_error};
 pub use error::{Error, Result};
 pub use exit_info::{ExitInfo, PANIC_EXIT_CODE, SIGNAL_EXIT_BASE};
+#[cfg(target_os = "linux")]
+pub use watchdog::die_with_jail;
 pub use watchdog::{ENV_WATCHDOG_FD, start_watchdog_thread, wait_for_parent_death};
