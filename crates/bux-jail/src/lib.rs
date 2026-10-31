@@ -222,9 +222,7 @@ pub fn spawn(shim: &Path, config_path: &Path, config: JailConfig) -> Result<Spaw
         cmd.env(ENV_WATCHDOG_FD, fd.to_string());
     }
     let landlock_fd = landlock_owned.as_ref().map(AsRawFd::as_raw_fd);
-    if let Some(fd) = landlock_fd {
-        cmd.env(ENV_LANDLOCK_FD, fd.to_string());
-    }
+    set_landlock_env(&mut cmd, landlock_fd);
 
     pre_exec::apply(
         &mut cmd,
@@ -271,6 +269,15 @@ fn identify(mut child: Child) -> Result<ShimProcess> {
             Err(e.into())
         }
     }
+}
+
+/// Name the ruleset in the shim's environment, or clear the variable without one.
+fn set_landlock_env(cmd: &mut Command, ruleset: Option<RawFd>) {
+    match ruleset {
+        Some(fd) => cmd.env(ENV_LANDLOCK_FD, fd.to_string()),
+        // The shim would try to apply a value inherited from this process.
+        None => cmd.env_remove(ENV_LANDLOCK_FD),
+    };
 }
 
 /// Resolve Landlock fd + status (K22).
@@ -589,20 +596,16 @@ mod tests {
         );
     }
 
-    /// `bwrap` if it can create a user namespace on this host.
-    #[cfg(target_os = "linux")]
-    fn usable_bwrap() -> Option<PathBuf> {
-        let bwrap = bux_bwrap::path()?;
-        Command::new(bwrap)
-            .args(["--unshare-pid", "--ro-bind", "/", "/", "--"])
-            .arg(bwrap)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .ok()?
-            .success()
-            .then(|| bwrap.to_path_buf())
+    #[test]
+    fn an_inherited_ruleset_fd_does_not_reach_the_shim() {
+        let mut cmd = Command::new("/bin/true");
+        cmd.env(ENV_LANDLOCK_FD, "9");
+        set_landlock_env(&mut cmd, None);
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == ENV_LANDLOCK_FD && value.is_none()),
+            "{cmd:?}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -611,7 +614,7 @@ mod tests {
         if !bux_landlock::is_available() {
             return;
         }
-        let Some(bwrap) = usable_bwrap() else {
+        let Some(bwrap) = bwrap::usable_bwrap() else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
