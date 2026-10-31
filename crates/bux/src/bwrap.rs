@@ -1,13 +1,10 @@
 //! Choosing the `bwrap` the Linux jailer runs.
 //!
-//! Ubuntu 24.04 and later let a process create a user namespace only under an
-//! `AppArmor` profile that allows it, and profiles attach by path. A distro's
-//! policy can only cover the system's binary, and no policy can safely cover the
-//! bundled one, whose path is user-writable and changes with each version. So the
-//! system's comes first and the bundled one serves hosts without bubblewrap.
+//! The system's `bwrap` comes first: `AppArmor` profiles attach by path, so a
+//! distro's policy can only cover that binary. The bundled one, whose path is
+//! user-writable and changes with each version, serves hosts without bubblewrap.
 //!
-//! A file existing says nothing about whether it works, so each candidate is run
-//! before it is used.
+//! Each candidate is run before it is used, because only that shows it works here.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -91,7 +88,8 @@ fn probe(bwrap: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// [`WORKING`], locked.
+/// [`WORKING`], locked. Poisoning is ignored: the list holds no invariant a panic
+/// could break.
 fn working() -> MutexGuard<'static, Vec<PathBuf>> {
     WORKING.lock().unwrap_or_else(PoisonError::into_inner)
 }
