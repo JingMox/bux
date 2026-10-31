@@ -65,13 +65,15 @@ impl Sandbox for BwrapSandbox {
 /// `bwrap` if it can create a user namespace on this host.
 #[cfg(test)]
 pub(crate) fn usable_bwrap() -> Option<std::path::PathBuf> {
+    use std::process::Stdio;
+
     let bwrap = bux_bwrap::path()?;
     Command::new(bwrap)
         .args(["--unshare-pid", "--ro-bind", "/", "/", "--"])
         .arg(bwrap)
         .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .ok()?
         .success()
