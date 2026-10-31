@@ -207,7 +207,7 @@ mod tests {
         let tmpfs = args.find("--tmpfs /tmp").unwrap();
         let bind = args
             .find(&format!("--ro-bind {0} {0}", bwrap.display()))
-            .unwrap_or_else(|| panic!("the candidate is not bound: {args}"));
+            .unwrap();
         assert!(
             tmpfs < bind,
             "the tmpfs must not hide the candidate: {args}"
