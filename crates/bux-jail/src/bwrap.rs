@@ -73,13 +73,15 @@ impl Sandbox for BwrapSandbox {
 /// `bwrap` if it can create a user namespace on this host.
 #[cfg(test)]
 pub(crate) fn usable_bwrap() -> Option<std::path::PathBuf> {
+    use std::process::Stdio;
+
     let bwrap = bux_bwrap::path()?;
     Command::new(bwrap)
         .args(["--unshare-pid", "--ro-bind", "/", "/", "--"])
         .arg(bwrap)
         .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .ok()?
         .success()
@@ -132,6 +134,8 @@ mod tests {
 
     #[test]
     fn kill_stops_every_process_in_the_jail() {
+        use std::time::{Duration, Instant};
+
         let Some(bwrap) = usable_bwrap() else {
             return;
         };
@@ -151,8 +155,8 @@ mod tests {
         let group = spawned.process.pid();
 
         // bwrap's outer process and the shim.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while live_group_members(group) < 2 && std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while live_group_members(group) < 2 && Instant::now() < deadline {
             std::thread::yield_now();
         }
         assert_eq!(live_group_members(group), 2);
