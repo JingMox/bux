@@ -236,11 +236,13 @@ impl ShimProcess {
     /// no process holds can still name a group whose leader was killed alone.
     #[cfg(target_os = "linux")]
     fn group_gone(self, _identified: bool) -> bool {
-        let _reaped = self.try_reap();
         match stat(self.pid) {
             Some(stat) if stat.start_time != self.start_time => true,
             Some(stat) if !matches!(stat.state, 'Z' | 'X') => false,
-            _ => live_group_members(self.pid) == 0,
+            _ => {
+                let _reaped = self.try_reap();
+                live_group_members(self.pid) == 0
+            }
         }
     }
 
