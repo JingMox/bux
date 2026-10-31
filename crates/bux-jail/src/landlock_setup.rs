@@ -96,10 +96,9 @@ fn path_restrictions(jail: &JailConfig, shim: &Path, config_path: &Path) -> Path
 
 /// Allow reading what `files` resolve to, and the directory holding it.
 ///
-/// `/etc` is allowed anyway, but `/etc/resolv.conf` is usually a symlink out of
-/// it (systemd-resolved, `NetworkManager`), and Landlock checks the target. The
-/// directory is needed because these daemons replace the file by rename, and a
-/// rule attaches to the old inode.
+/// Landlock checks a symlink's target, and `/etc/resolv.conf` usually points out
+/// of `/etc` (systemd-resolved, `NetworkManager`). These daemons replace the file
+/// by rename, and a rule stays on the old inode, so the directory is allowed too.
 fn allow_symlink_targets(mut r: PathRestrictions, files: &[&str]) -> PathRestrictions {
     for file in files {
         if let Ok(target) = std::fs::canonicalize(file) {
