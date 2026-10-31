@@ -8,11 +8,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
 
-/// No `bwrap` on `$PATH` or next to bux.
-const NOT_FOUND: &str =
-    "bwrap required (jailer); install with: curl -fsSL https://sh.qntx.org/bux | sh";
 /// Where the Ubuntu steps are explained.
 const DOCS: &str = "https://github.com/qntx/bux/blob/main/crates/bux/README.md#linux-jailer";
 
@@ -27,10 +23,6 @@ const PROFILE_PATH: &str = "/etc/apparmor.d/bwrap-userns-restrict";
 /// The only path Ubuntu's profile attaches to.
 const SYSTEM_BWRAP: &str = "/usr/bin/bwrap";
 
-/// Candidates that worked in this process. Only successes are kept, so a fix on
-/// the host takes effect without restarting `bux serve`.
-static WORKING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
 /// The first `bwrap` that works here: on `$PATH`, then the bundled one.
 ///
 /// # Errors
@@ -39,14 +31,14 @@ static WORKING: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 pub(crate) fn select() -> Result<PathBuf, String> {
     let candidates = candidates();
     if candidates.is_empty() {
-        return Err(NOT_FOUND.to_owned());
+        return Err(bux_jail::Error::BwrapUnavailable.to_string());
     }
     let mut lines =
         vec!["jailer unavailable: no bwrap on this host can start a sandbox".to_owned()];
     for bwrap in candidates {
-        match probe(&bwrap) {
+        match bux_jail::probe_bwrap(&bwrap) {
             Ok(()) => return Ok(bwrap),
-            Err(message) => lines.push(format!("  {}: {message}", bwrap.display())),
+            Err(e) => lines.push(format!("  {}: {e}", bwrap.display())),
         }
     }
     lines.extend(advice(Host::read()));
@@ -76,28 +68,6 @@ fn candidates() -> Vec<PathBuf> {
         }
     }
     candidates
-}
-
-/// [`bux_jail::probe_bwrap`], unless `bwrap` has already worked.
-fn probe(bwrap: &Path) -> Result<(), String> {
-    if working().iter().any(|path| path == bwrap) {
-        return Ok(());
-    }
-    bux_jail::probe_bwrap(bwrap).map_err(|e| e.to_string())?;
-    working().push(bwrap.to_path_buf());
-    Ok(())
-}
-
-/// [`WORKING`], locked. Poisoning is ignored: the list holds no invariant a panic
-/// could break.
-fn working() -> MutexGuard<'static, Vec<PathBuf>> {
-    WORKING.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Forget what worked: tests plant different scripts at one path.
-#[cfg(test)]
-pub(crate) fn forget_working() {
-    working().clear();
 }
 
 /// Make a fake `bwrap` at `path` that runs `body`.
@@ -229,7 +199,6 @@ mod tests {
     )]
     fn prefers_path_over_the_bundled_bwrap() {
         let mut env = sidecar_env::lock();
-        forget_working();
         let dir = tempfile::tempdir().unwrap();
         let on_path = dir.path().join("bwrap");
         fake_bwrap(&on_path, "exit 0");
@@ -247,7 +216,6 @@ mod tests {
     )]
     fn ignores_relative_path_entries() {
         let mut env = sidecar_env::lock();
-        forget_working();
         env.set("PATH", "relative-dir::.");
         assert!(
             candidates()
@@ -265,7 +233,6 @@ mod tests {
     )]
     fn falls_back_when_the_one_on_path_fails() {
         let mut env = sidecar_env::lock();
-        forget_working();
         let dir = tempfile::tempdir().unwrap();
         fake_bwrap(&dir.path().join("bwrap"), "echo denied >&2; exit 1");
         env.set("PATH", dir.path());
@@ -282,7 +249,6 @@ mod tests {
     )]
     fn reports_each_failure() {
         let mut env = sidecar_env::lock();
-        forget_working();
         let dir = tempfile::tempdir().unwrap();
         let on_path = dir.path().join("bwrap");
         fake_bwrap(&on_path, "echo denied-on-path >&2; exit 1");
@@ -308,30 +274,8 @@ mod tests {
         clippy::significant_drop_tightening,
         reason = "env lock must outlive select"
     )]
-    fn only_a_success_is_remembered() {
-        let mut env = sidecar_env::lock();
-        forget_working();
-        let dir = tempfile::tempdir().unwrap();
-        let on_path = dir.path().join("bwrap");
-        fake_bwrap(&on_path, "exit 1");
-        env.set("PATH", dir.path());
-        let real = fs::canonicalize(&on_path).unwrap();
-
-        assert!(probe(&real).is_err());
-        fake_bwrap(&on_path, "exit 0");
-        assert!(probe(&real).is_ok(), "a failure must not be cached");
-        fake_bwrap(&on_path, "exit 1");
-        assert!(probe(&real).is_ok(), "a success is cached");
-    }
-
-    #[test]
-    #[allow(
-        clippy::significant_drop_tightening,
-        reason = "env lock must outlive select"
-    )]
     fn no_candidate_says_how_to_install() {
         let mut env = sidecar_env::lock();
-        forget_working();
         let dir = tempfile::tempdir().unwrap();
         env.set("PATH", dir.path());
         drop(fs::remove_file(
@@ -340,7 +284,10 @@ mod tests {
         if !crate::payload::bundled_bwrap().is_empty() {
             return;
         }
-        assert_eq!(select().unwrap_err(), NOT_FOUND);
+        assert_eq!(
+            select().unwrap_err(),
+            bux_jail::Error::BwrapUnavailable.to_string()
+        );
     }
 
     #[test]
@@ -356,19 +303,13 @@ mod tests {
 
     #[test]
     fn the_profile_install_stops_at_the_first_failing_step() {
-        let advice = advice(HOST);
-        let first = advice
-            .iter()
-            .position(|line| line.contains("curl -fsSLO"))
-            .unwrap();
-        let last = advice
-            .iter()
-            .position(|line| line.contains("apparmor_parser -r"))
-            .unwrap();
-        assert_eq!(last - first, 3, "{advice:?}");
-        for line in &advice[first..last] {
-            assert!(line.ends_with(" &&"), "{line}");
-        }
+        let steps: Vec<_> = advice(HOST)
+            .into_iter()
+            .skip_while(|line| !line.contains("curl -fsSLO"))
+            .take_while(|line| !line.contains("apparmor_parser -r"))
+            .collect();
+        assert_eq!(steps.len(), 3, "{steps:?}");
+        assert!(steps.iter().all(|line| line.ends_with(" &&")), "{steps:?}");
     }
 
     #[test]

@@ -150,14 +150,14 @@ impl HostInfo {
         #[cfg(unix)]
         {
             let mut caps = bux_jail::checks::check_host();
-            let (bwrap, jailer_warning) = host_bwrap();
-            caps.namespaces = bwrap.is_some();
+            let bwrap = host_bwrap();
+            caps.namespaces = matches!(bwrap, Ok(Some(_)));
             let mut isolation_warnings = bux_jail::checks::audit_isolation(&caps);
-            isolation_warnings.extend(jailer_warning);
+            isolation_warnings.extend(bwrap.as_ref().err().cloned());
             Self {
                 virtualization: caps.virtualization,
                 namespaces: caps.namespaces,
-                bwrap,
+                bwrap: bwrap.ok().flatten(),
                 seccomp: caps.seccomp,
                 mandatory_access_control: caps.mandatory_access_control,
                 cgroups: caps.cgroups,
@@ -183,17 +183,15 @@ impl HostInfo {
 
 /// The `bwrap` the jailer would run, or why none works.
 #[cfg(target_os = "linux")]
-fn host_bwrap() -> (Option<std::path::PathBuf>, Option<String>) {
-    match crate::bwrap::select() {
-        Ok(bwrap) => (Some(bwrap), None),
-        Err(why) => (None, Some(why)),
-    }
+fn host_bwrap() -> Result<Option<std::path::PathBuf>, String> {
+    crate::bwrap::select().map(Some)
 }
 
 /// Only Linux has a `bwrap`.
 #[cfg(all(unix, not(target_os = "linux")))]
-const fn host_bwrap() -> (Option<std::path::PathBuf>, Option<String>) {
-    (None, None)
+#[allow(clippy::unnecessary_wraps, reason = "same signature as on Linux")]
+const fn host_bwrap() -> Result<Option<std::path::PathBuf>, String> {
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -227,7 +225,6 @@ mod tests {
     )]
     fn probe_namespaces_uses_engine_bwrap_lookup() {
         let mut env = crate::guest::sidecar_env::lock();
-        crate::bwrap::forget_working();
         let empty = tempfile::tempdir().unwrap();
         env.set("PATH", empty.path());
         let planted = crate::guest::sidecar_env::Planted::sibling("bwrap", b"");
@@ -263,7 +260,6 @@ mod tests {
     )]
     fn probe_reports_a_bwrap_that_does_not_work() {
         let mut env = crate::guest::sidecar_env::lock();
-        crate::bwrap::forget_working();
         let empty = tempfile::tempdir().unwrap();
         env.set("PATH", empty.path());
         let planted = crate::guest::sidecar_env::Planted::sibling("bwrap", b"");
