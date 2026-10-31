@@ -6,10 +6,14 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use bux_bwrap::{BwrapCommand, Namespace};
 
-use super::{JailConfig, Sandbox, SandboxCapabilities, SandboxKind};
+use super::{Error, JailConfig, Result, Sandbox, SandboxCapabilities, SandboxKind};
+
+/// How long a `bwrap` gets to start a jail and exit, which takes milliseconds.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The namespaces and base mounts of every jail.
 fn base_command(bwrap: &Path) -> Option<BwrapCommand> {
@@ -32,28 +36,54 @@ fn base_command(bwrap: &Path) -> Option<BwrapCommand> {
 ///
 /// # Errors
 ///
-/// Returns what `bwrap` printed, or why it could not run.
-pub fn probe_bwrap(bwrap: &Path) -> Result<(), String> {
-    let builder =
-        base_command(bwrap).ok_or_else(|| format!("{} is not a file", bwrap.display()))?;
-    let output = builder
+/// Returns [`Error::BwrapProbe`] with what `bwrap` printed, or if it is not a file
+/// or does not exit in time, and [`Error::Io`] if it cannot run.
+pub fn probe_bwrap(bwrap: &Path) -> Result<()> {
+    probe_with_timeout(bwrap, PROBE_TIMEOUT)
+}
+
+/// [`probe_bwrap`] that gives up after `timeout`.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "polls a child in synchronous setup code"
+)]
+fn probe_with_timeout(bwrap: &Path, timeout: Duration) -> Result<()> {
+    let builder = base_command(bwrap)
+        .ok_or_else(|| Error::BwrapProbe(format!("{} is not a file", bwrap.display())))?;
+    // The command is `bwrap` itself, which the tmpfs mounts may hide.
+    let mut child = builder
+        .die_with_parent()
+        .ro_bind(bwrap, bwrap)
         .program(bwrap)
         .arg("--version")
         .into_command()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            drop(child.kill());
+            drop(child.wait());
+            return Err(Error::BwrapProbe(format!(
+                "did not exit within {} ms",
+                timeout.as_millis()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let output = child.wait_with_output()?;
     if output.status.success() {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
-    Err(if stderr.is_empty() {
+    Err(Error::BwrapProbe(if stderr.is_empty() {
         output.status.to_string()
     } else {
         stderr.to_owned()
-    })
+    }))
 }
 
 /// Bubblewrap (bwrap) sandbox for Linux.
@@ -174,6 +204,22 @@ mod tests {
                 .ends_with(&format!("-- {} --version", bwrap.display())),
             "{args}"
         );
+        let tmpfs = args.find("--tmpfs /tmp").unwrap();
+        let bind = args
+            .find(&format!("--ro-bind {0} {0}", bwrap.display()))
+            .unwrap_or_else(|| panic!("the candidate is not bound: {args}"));
+        assert!(
+            tmpfs < bind,
+            "the tmpfs must not hide the candidate: {args}"
+        );
+    }
+
+    #[test]
+    fn probe_gives_up_on_a_bwrap_that_hangs() {
+        let dir = tempfile::tempdir().unwrap();
+        let bwrap = fake_bwrap(dir.path(), "exec /bin/sleep 60");
+        let err = probe_with_timeout(&bwrap, Duration::from_millis(100)).unwrap_err();
+        assert!(err.to_string().contains("did not exit"), "{err}");
     }
 
     #[test]
@@ -184,18 +230,19 @@ mod tests {
             "echo 'bwrap: setting up uid map: Permission denied' >&2; exit 1",
         );
         assert_eq!(
-            probe_bwrap(&bwrap).unwrap_err(),
+            probe_bwrap(&bwrap).unwrap_err().to_string(),
             "bwrap: setting up uid map: Permission denied"
         );
 
         let silent = fake_bwrap(dir.path(), "exit 3");
         assert!(
-            probe_bwrap(&silent).unwrap_err().contains('3'),
+            probe_bwrap(&silent).unwrap_err().to_string().contains('3'),
             "a silent failure reports its exit status"
         );
         assert!(
             probe_bwrap(Path::new("/nonexistent/bwrap"))
                 .unwrap_err()
+                .to_string()
                 .contains("not a file")
         );
     }

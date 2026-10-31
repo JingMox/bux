@@ -83,7 +83,7 @@ fn probe(bwrap: &Path) -> Result<(), String> {
     if working().iter().any(|path| path == bwrap) {
         return Ok(());
     }
-    bux_jail::probe_bwrap(bwrap)?;
+    bux_jail::probe_bwrap(bwrap).map_err(|e| e.to_string())?;
     working().push(bwrap.to_path_buf());
     Ok(())
 }
