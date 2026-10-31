@@ -421,6 +421,11 @@ mod tests {
         );
     }
 
+    /// Serializes the tests that open rulesets: [`landlock_fd_count`] counts the
+    /// whole process.
+    #[cfg(target_os = "linux")]
+    static RULESETS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Open landlock ruleset fds in this process. Only rulesets: other tests
     /// open and close fds concurrently, so a count of all fds is racy.
     #[cfg(target_os = "linux")]
@@ -438,6 +443,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn spawn_without_bwrap_does_not_leak_landlock_fd() {
+        let _rulesets = RULESETS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cfg = JailConfig {
             landlock: true,
             ..jail(None)
@@ -534,7 +542,12 @@ mod tests {
     /// descriptor.
     #[cfg(target_os = "linux")]
     fn fd_listing(script: &Path, log: &Path, cfg: JailConfig) -> String {
-        let spawned = spawn(Path::new("/bin/sh"), script, cfg).unwrap();
+        let spawned = {
+            let _rulesets = RULESETS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            spawn(Path::new("/bin/sh"), script, cfg).unwrap()
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !std::fs::read_to_string(log).unwrap().contains("listed")
             && std::time::Instant::now() < deadline
